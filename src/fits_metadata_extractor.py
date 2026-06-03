@@ -6,16 +6,25 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 1 - Updated with real-world header validation
+Sprint 2, Phase 1 - Rev 2: calibration frame handling
 
 Validated against actual files from:
-  - DWARF 3 (firmware pre-1.4 / TELESCOP='DWARFIII')
+  - DWARF 3 (firmware pre-1.4  / TELESCOP='DWARFIII')
   - DWARF 3 (firmware 1.4.15.2 / TELESCOP='DWARF 3')
   - DWARF Mini (firmware 1.0.25.2 / TELESCOP='DWARF mini')
   - Seestar S50 (CREATOR='ZWO Seestar S50')
+
+Rev 2 changes:
+  - Calibration frames (bias/dark/flat) have stripped FITS headers on DWARF.
+    Added two new fallback strategies so they no longer flood surprises.log:
+      1. Directory-path detection  — reads device name from folder structure
+      2. Filename-based classification — reads frame type from filename prefix
+  - Dark/bias/flat filenames also carry exposure, gain, and temperature;
+    these are now extracted and stored for use by the dark-matching engine
+    in Phase 4.
 """
 
-import os
+import re
 import sys
 import json
 import logging
@@ -29,7 +38,7 @@ from astropy.io import fits
 # DEVICE CONFIGURATION
 #
 # When a firmware update changes a header value, update this section ONLY.
-# No other code changes needed - device detection logic reads from here.
+# No other code changes needed — detection logic reads from here at runtime.
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEVICE_SIGNATURES: dict = {
@@ -39,32 +48,68 @@ DEVICE_SIGNATURES: dict = {
         "TELESCOPE":  ["DWARFIII", "DWARF 3"],
         "INSTRUMENT": ["DWARFIII", "DWARF 3"],
         "ORIGIN":     ["DWARFLAB"],
-        "image_size": (3856, 2180),          # NAXIS1 x NAXIS2 as secondary check
+        "image_size": (3856, 2180),
+        # Directory names used in Ed's file system (lowercase for matching)
+        "path_names": ["dwarf 3", "dwarf_3", "dwarfiii", "dwarf3"],
     },
     "DWARF_MINI": {
-        "TELESCOPE":  ["DWARF mini"],         # lowercase 'm' - exact match required
+        "TELESCOPE":  ["DWARF mini"],           # lowercase 'm' — exact match required
         "INSTRUMENT": ["DWARF mini"],
         "ORIGIN":     ["DWARFLAB"],
         "image_size": (1920, 1080),
+        "path_names": ["dwarf mini", "dwarf_mini", "dwarfmini"],
     },
     "SEESTAR_S50": {
-        # TELESCOP embeds serial: 'S50_40d24ed8' - handled separately
-        "CREATOR":    ["ZWO Seestar S50"],    # most reliable field
+        # TELESCOP embeds serial: 'S50_40d24ed8' — handled separately below
+        "CREATOR":    ["ZWO Seestar S50"],
         "INSTRUMENT": ["Seestar S50"],
-        "image_size": (1080, 1920),           # portrait orientation
+        "image_size": (1080, 1920),             # portrait orientation
+        "path_names": ["seestar s50", "seestar_s50", "seestar50", "s50"],
     },
     # ── Add future devices here without touching any other code ──────────────
     # "SEESTAR_S30_PRO": {
     #     "CREATOR":    ["ZWO Seestar S30 Pro"],
     #     "INSTRUMENT": ["Seestar S30 Pro"],
+    #     "path_names": ["seestar s30 pro", "seestar_s30_pro", "s30pro"],
     # },
     # "ASIAIR": {
-    #     "CREATOR":    ["ASIAIR"],
+    #     "CREATOR": ["ASIAIR"],
+    #     "path_names": ["asiair"],
     # },
 }
 
 # All FITS file extensions we will process
 FITS_EXTENSIONS: frozenset = frozenset({'.fits', '.fit', '.FITS', '.FIT'})
+
+# Filename prefixes that unambiguously identify calibration frame types.
+# Key = lowercase prefix, Value = frame type string.
+# Longer prefixes must come before shorter ones if they share a stem.
+FRAME_FILENAME_PREFIXES: dict = {
+    'bias_':  'BIAS',
+    'dark_':  'DARK',
+    'flat_':  'FLAT',
+    'raw_':   'DARK',    # DWARF individual dark sub-frames
+    'light_': 'LIGHT',   # Seestar light sub-frames
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Calibration filename patterns  (DWARF produces metadata-rich filenames
+# even when FITS headers are stripped down)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# dark_exp_30.000000_gain_60_bin_1_34C_stack_1.fits
+_RE_DARK_STACK = re.compile(
+    r'dark_exp_([\d.]+)_gain_(\d+)_bin_\d+_(-?\d+)C_stack_\d+', re.IGNORECASE)
+
+# raw_10s_60_0000_20260102-184951912_35C.fits  (individual dark subs)
+_RE_DARK_RAW = re.compile(
+    r'raw_([\d.]+)s_(\d+)_\d+_[\d-]+_(-?\d+)C', re.IGNORECASE)
+
+# bias_gain_2_bin_1.fits
+_RE_BIAS = re.compile(r'bias_gain_(\d+)_bin_\d+', re.IGNORECASE)
+
+# flat_gain_2_bin_1_ir_0.fits  or  flat_gain_2_bin_1.fits
+_RE_FLAT = re.compile(r'flat_gain_(\d+)_bin_\d+', re.IGNORECASE)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -74,15 +119,18 @@ FITS_EXTENSIONS: frozenset = frozenset({'.fits', '.fit', '.FITS', '.FIT'})
 def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
     """
     Two-channel logging:
-      - Console: INFO and above (normal progress)
-      - File:    DEBUG and above (full detail including unknown headers)
-    The 'surprises.log' file is your early-warning system for firmware changes.
+      Console : INFO and above  (normal progress)
+      File    : DEBUG and above (full detail including path-based detections)
+
+    surprises.log is your early-warning system for firmware changes.
+    With Rev 2, calibration frames no longer flood it with false alarms.
     """
     logger = logging.getLogger('fits_extractor')
     logger.setLevel(logging.DEBUG)
 
-    fmt = logging.Formatter('%(asctime)s [%(levelname)-8s] %(message)s',
-                            datefmt='%Y-%m-%d %H:%M:%S')
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)-8s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S')
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
@@ -109,103 +157,189 @@ logger = setup_logging()
 class FITSMetadata:
     """All metadata extracted from a single FITS file."""
 
-    # ── File ──────────────────────────────────────────────────
+    # ── File ──────────────────────────────────────────────────────────────────
     file_path:      str = ""
     file_name:      str = ""
     file_extension: str = ""
 
-    # ── Device ────────────────────────────────────────────────
-    device_type:  str = "UNKNOWN"   # DWARF_3 | DWARF_MINI | SEESTAR_S50 | UNKNOWN
-    device_id:    str = ""          # unique per physical unit (MAC or serial)
-    telescope:    str = ""
-    instrument:   str = ""
-    origin:       str = ""
-    firmware:     str = ""
-    mac_address:  str = ""
+    # ── Device ────────────────────────────────────────────────────────────────
+    device_type:       str = "UNKNOWN"
+    device_id:         str = ""
+    device_source:     str = ""     # 'header' | 'path' | 'dimensions' | 'unknown'
+    telescope:         str = ""
+    instrument:        str = ""
+    origin:            str = ""
+    firmware:          str = ""
+    mac_address:       str = ""
 
-    # ── Frame ─────────────────────────────────────────────────
-    frame_type: str = "UNKNOWN"     # LIGHT | DARK | FLAT | BIAS | UNKNOWN
+    # ── Frame ─────────────────────────────────────────────────────────────────
+    frame_type:        str = "UNKNOWN"  # LIGHT | DARK | FLAT | BIAS | UNKNOWN
+    frame_type_source: str = ""         # 'imagetyp' | 'object' | 'ra_dec' | 'filename' | 'unknown'
 
-    # ── Target ────────────────────────────────────────────────
+    # ── Target ────────────────────────────────────────────────────────────────
     object_name: str             = ""
     ra:          Optional[float] = None
     dec:         Optional[float] = None
 
-    # ── Capture parameters ────────────────────────────────────
+    # ── Capture parameters ────────────────────────────────────────────────────
     exposure_time: Optional[float] = None
     gain:          Optional[int]   = None
     filter_name:   str             = ""
-    temperature:   Optional[float] = None   # sensor temp in °C
+    temperature:   Optional[float] = None
 
-    # ── Image properties ──────────────────────────────────────
-    image_width:  Optional[int]   = None
-    image_height: Optional[int]   = None
-    bit_depth:    Optional[int]   = None
-    bayer_pattern: str            = ""
-    focal_length: Optional[float] = None
-    pixel_size_x: Optional[float] = None
-    pixel_size_y: Optional[float] = None
+    # ── Image properties ──────────────────────────────────────────────────────
+    image_width:   Optional[int]   = None
+    image_height:  Optional[int]   = None
+    bit_depth:     Optional[int]   = None
+    bayer_pattern: str             = ""
+    focal_length:  Optional[float] = None
+    pixel_size_x:  Optional[float] = None
+    pixel_size_y:  Optional[float] = None
 
-    # ── Date / Time ───────────────────────────────────────────
+    # ── Date / Time ───────────────────────────────────────────────────────────
     observation_date:  Optional[str] = None
     observation_year:  Optional[int] = None
     observation_month: Optional[int] = None
 
-    # ── Location (Seestar provides this) ──────────────────────
+    # ── Location (Seestar provides this) ──────────────────────────────────────
     site_latitude:  Optional[float] = None
     site_longitude: Optional[float] = None
 
-    # ── Quality / diagnostics ─────────────────────────────────
-    is_valid:        bool             = True
-    warnings:        list             = field(default_factory=list)
-    unknown_headers: dict             = field(default_factory=dict)
+    # ── Quality / diagnostics ─────────────────────────────────────────────────
+    is_valid:        bool = True
+    warnings:        list = field(default_factory=list)
+    unknown_headers: dict = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core extraction helpers
+# Calibration filename parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def detect_device(header: fits.Header) -> tuple:
+def parse_calibration_filename(filename: str) -> dict:
     """
-    Identify the capture device from FITS headers.
+    Extract exposure, gain, and temperature from DWARF calibration filenames.
+    Calibration frames often have minimal FITS headers but information-rich names.
 
-    Detection order:
-      1. TELESCOPE field exact match
-      2. Seestar's serial-embedded TELESCOPE ('S50_...')
-      3. CREATOR field (Seestar)
-      4. INSTRUMENT field
-      5. Fallback: image dimensions (with warning - possible new firmware)
-      6. UNKNOWN (with warning logged to surprises.log)
+    Handles:
+      dark_exp_30.000000_gain_60_bin_1_34C_stack_1.fits  → exp=30, gain=60, temp=34
+      raw_10s_60_0000_20260102-184951912_35C.fits         → exp=10, gain=60, temp=35
+      bias_gain_2_bin_1.fits                              → gain=2
+      flat_gain_2_bin_1_ir_0.fits                         → gain=2
+
+    Returns a (possibly partial) dict with keys: exposure_time, gain, temperature.
+    Empty dict if no pattern matched.
+    """
+    stem = Path(filename).stem
+    result: dict = {}
+
+    m = _RE_DARK_STACK.search(stem)
+    if m:
+        result['exposure_time'] = float(m.group(1))
+        result['gain']          = int(m.group(2))
+        result['temperature']   = float(m.group(3))
+        return result
+
+    m = _RE_DARK_RAW.search(stem)
+    if m:
+        result['exposure_time'] = float(m.group(1))
+        result['gain']          = int(m.group(2))
+        result['temperature']   = float(m.group(3))
+        return result
+
+    m = _RE_BIAS.search(stem)
+    if m:
+        result['gain'] = int(m.group(1))
+        return result
+
+    m = _RE_FLAT.search(stem)
+    if m:
+        result['gain'] = int(m.group(1))
+        return result
+
+    return result
+
+
+def classify_from_filename(filename: str) -> Optional[str]:
+    """
+    Classify frame type from filename prefix alone.
+    Used as a fallback when FITS headers carry no IMAGETYP and OBJECT is empty.
+
+    Returns frame type string or None if no prefix matched.
+    """
+    lower = Path(filename).name.lower()
+    for prefix, frame_type in FRAME_FILENAME_PREFIXES.items():
+        if lower.startswith(prefix):
+            return frame_type
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Device detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_device_from_path(file_path: Path) -> Optional[str]:
+    """
+    Identify device from the directory path when FITS headers are absent.
+
+    DWARF calibration frames are stored under device-named directories:
+      .../2026/DWARF 3/DWARF_DARK/...
+      .../2026/DWARF Mini/March 2026/...
+
+    Checks every component of the path (case-insensitive).
+    Returns device type string or None if no match.
+    """
+    parts_lower = [p.lower() for p in file_path.parts]
+    for device_name, sigs in DEVICE_SIGNATURES.items():
+        for path_token in sigs.get('path_names', []):
+            if path_token in parts_lower:
+                return device_name
+    return None
+
+
+def detect_device(header: fits.Header,
+                  file_path: Optional[Path] = None) -> tuple:
+    """
+    Identify the capture device. Detection cascade (stops at first success):
+
+      1. TELESCOPE header exact match
+      2. Seestar serial pattern in TELESCOPE ('S50_...')
+      3. CREATOR header
+      4. INSTRUMENT header
+      5. Directory path  ← NEW: handles calibration frames with stripped headers
+      6. Image dimensions fallback (warns — possible firmware rename)
+      7. UNKNOWN (warns — add to DEVICE_SIGNATURES)
 
     Returns: (device_type: str, warnings: list[str])
     """
     warnings: list = []
 
-    # Normalise field names - astropy uses the 8-char FITS key
     telescop   = str(header.get('TELESCOP',  header.get('TELESCOPE',  ''))).strip()
     instrument = str(header.get('INSTRUME',  header.get('INSTRUMENT', ''))).strip()
     creator    = str(header.get('CREATOR',   '')).strip()
     naxis1     = int(header.get('NAXIS1', 0))
     naxis2     = int(header.get('NAXIS2', 0))
 
+    # ── Methods 1-4: FITS header ──────────────────────────────────────────────
     for device_name, sigs in DEVICE_SIGNATURES.items():
-        # 1. TELESCOPE exact match
         if telescop and telescop in sigs.get('TELESCOPE', []):
             return device_name, warnings
-
-        # 2. Seestar serial pattern: 'S50_xxxxxxxx'
         if device_name == 'SEESTAR_S50' and telescop.upper().startswith('S50_'):
             return device_name, warnings
-
-        # 3. CREATOR field
         if creator and creator in sigs.get('CREATOR', []):
             return device_name, warnings
-
-        # 4. INSTRUMENT field
         if instrument and instrument in sigs.get('INSTRUMENT', []):
             return device_name, warnings
 
-    # 5. Fallback: image dimensions (firmware may have renamed the telescope field)
+    # ── Method 5: directory path (calibration frames) ─────────────────────────
+    if file_path is not None:
+        path_device = detect_device_from_path(file_path)
+        if path_device:
+            logger.debug(
+                f"[path-detect] {file_path.name} → {path_device} "
+                f"(calibration file with minimal headers — expected behaviour)")
+            return path_device, warnings
+
+    # ── Method 6: image dimensions (warns — possible firmware rename) ─────────
     dim_map = {
         (3856, 2180): 'DWARF_3',
         (1920, 1080): 'DWARF_MINI',
@@ -214,39 +348,44 @@ def detect_device(header: fits.Header) -> tuple:
     if (naxis1, naxis2) in dim_map:
         device = dim_map[(naxis1, naxis2)]
         msg = (f"Device identified by image size ({naxis1}×{naxis2}) as {device}. "
-               f"TELESCOP='{telescop}' is not in known signatures — "
-               f"possible firmware rename. Please update DEVICE_SIGNATURES.")
+               f"TELESCOP='{telescop}' not in known signatures — "
+               f"possible firmware rename. Update DEVICE_SIGNATURES['TELESCOPE'].")
         warnings.append(msg)
         logger.warning(msg)
         return device, warnings
 
-    # 6. Truly unknown
+    # ── Method 7: truly unknown ───────────────────────────────────────────────
     msg = (f"UNKNOWN device — TELESCOP='{telescop}', INSTRUMENT='{instrument}', "
            f"CREATOR='{creator}', dimensions={naxis1}×{naxis2}. "
-           f"Check surprises.log and update DEVICE_SIGNATURES if this is a new device.")
+           f"Check surprises.log and add to DEVICE_SIGNATURES if new device.")
     warnings.append(msg)
     logger.warning(msg)
     return 'UNKNOWN', warnings
 
 
-def classify_frame(header: fits.Header) -> tuple:
+# ──────────────────────────────────────────────────────────────────────────────
+# Frame classification
+# ──────────────────────────────────────────────────────────────────────────────
+
+def classify_frame(header: fits.Header,
+                   filename: Optional[str] = None) -> tuple:
     """
     Classify frame type: LIGHT | DARK | FLAT | BIAS | UNKNOWN.
 
-    Strategy:
-      1. IMAGETYP field if present (Seestar provides this; DWARF does not)
-      2. OBJECT field populated → LIGHT (DWARF)
-      3. OBJECT empty + RA≈0 + DEC≈0 → DARK (DWARF)
-      4. Anything else → UNKNOWN (logged)
+    Detection cascade:
+      1. IMAGETYP header (Seestar provides this; DWARF does not)
+      2. OBJECT header populated → LIGHT  (DWARF light frames)
+      3. OBJECT empty + RA≈0 + DEC≈0 → DARK  (DWARF dark frames)
+      4. Filename prefix  ← NEW: bias_/dark_/flat_/raw_/light_
+      5. UNKNOWN (logged to surprises.log)
 
     Returns: (frame_type: str, warnings: list[str])
     """
     warnings: list = []
 
-    # ── Method 1: explicit IMAGETYP (Seestar) ─────────────────────────────────
+    # ── Method 1: IMAGETYP (Seestar) ─────────────────────────────────────────
     imagetyp = str(header.get('IMAGETYP', '')).strip()
     if imagetyp:
-        normalised = imagetyp.upper()
         type_map = {
             'LIGHT':      'LIGHT',
             'DARK':       'DARK',
@@ -255,43 +394,53 @@ def classify_frame(header: fits.Header) -> tuple:
             'BIAS':       'BIAS',
             'OFFSET':     'BIAS',
         }
+        normalised = imagetyp.upper()
         if normalised in type_map:
             return type_map[normalised], warnings
-
-        # Unrecognised value - log it and fall through
         msg = f"Unrecognised IMAGETYP value: '{imagetyp}' — falling back to inference."
         warnings.append(msg)
         logger.warning(msg)
 
-    # ── Method 2: infer from OBJECT + RA/DEC (DWARF) ─────────────────────────
+    # ── Method 2: OBJECT field populated (DWARF lights) ──────────────────────
     object_name = str(header.get('OBJECT', '')).strip()
-    try:
-        ra  = float(header.get('RA',  -999))
-        dec = float(header.get('DEC', -999))
-        ra_zero  = abs(ra)  < 0.001
-        dec_zero = abs(dec) < 0.001
-    except (ValueError, TypeError):
-        ra_zero = dec_zero = False
-
     if object_name:
         return 'LIGHT', warnings
 
-    if ra_zero and dec_zero:
-        return 'DARK', warnings
+    # ── Method 3: RA/DEC at zero (DWARF darks) ───────────────────────────────
+    try:
+        ra  = float(header.get('RA',  -999))
+        dec = float(header.get('DEC', -999))
+        if abs(ra) < 0.001 and abs(dec) < 0.001:
+            return 'DARK', warnings
+    except (ValueError, TypeError):
+        pass
 
-    # ── Can't determine ───────────────────────────────────────────────────────
+    # ── Method 4: filename prefix (calibration frames with stripped headers) ──
+    if filename is not None:
+        ft = classify_from_filename(filename)
+        if ft is not None:
+            logger.debug(
+                f"[filename-classify] {filename} → {ft} "
+                f"(header had no IMAGETYP/OBJECT — classified from filename prefix)")
+            return ft, warnings
+
+    # ── Method 5: cannot determine ───────────────────────────────────────────
     msg = (f"Cannot classify frame — IMAGETYP='{imagetyp}', "
-           f"OBJECT='{object_name}', RA={header.get('RA')}, DEC={header.get('DEC')}.")
+           f"OBJECT='{object_name}', RA={header.get('RA')}, "
+           f"DEC={header.get('DEC')}, filename='{filename}'.")
     warnings.append(msg)
     logger.warning(msg)
     return 'UNKNOWN', warnings
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper extractors
+# ──────────────────────────────────────────────────────────────────────────────
+
 def get_temperature(header: fits.Header) -> Optional[float]:
     """
     Extract sensor temperature (°C).
-    DWARF uses DET-TEMP; Seestar uses CCD-TEMP.
-    Checks all known variants so new field names only need adding here.
+    DWARF → DET-TEMP;  Seestar → CCD-TEMP.
     """
     for field_name in ('DET-TEMP', 'CCD-TEMP', 'CCDTEMP', 'TEMPERAT', 'SET-TEMP'):
         val = header.get(field_name)
@@ -299,34 +448,32 @@ def get_temperature(header: fits.Header) -> Optional[float]:
             try:
                 return float(val)
             except (ValueError, TypeError):
-                logger.warning(f"Could not convert temperature field {field_name}='{val}' to float.")
+                logger.warning(
+                    f"Could not convert temperature {field_name}='{val}' to float.")
     return None
 
 
 def get_exposure(header: fits.Header) -> Optional[float]:
     """
-    Extract exposure time in seconds.
-    DWARF uses EXPTIME; Seestar has both EXPOSURE and EXPTIME.
-    EXPTIME is the more standard FITS keyword so it takes priority.
+    Extract exposure time (seconds).
+    DWARF → EXPTIME;  Seestar → both EXPOSURE and EXPTIME (EXPTIME wins).
     """
-    for field_name in ('EXPTIME', 'EXPOSURE', 'EXP_TIME', 'EXPTIMEE'):
+    for field_name in ('EXPTIME', 'EXPOSURE', 'EXP_TIME'):
         val = header.get(field_name)
         if val is not None:
             try:
                 return float(val)
             except (ValueError, TypeError):
-                logger.warning(f"Could not convert exposure field {field_name}='{val}' to float.")
+                logger.warning(
+                    f"Could not convert exposure {field_name}='{val}' to float.")
     return None
 
 
 def parse_observation_date(header: fits.Header) -> tuple:
     """
     Parse observation date/time from header.
-    Handles ISO 8601 with and without fractional seconds.
-
-    Returns: (date_string, year, month)
+    Returns: (date_string, year, month) — all None if absent or unparseable.
     """
-    # Try standard and device-specific field names
     for field_name in ('DATE-OBS', 'DATE_OBS', 'DATEOBS'):
         date_str = str(header.get(field_name, '')).strip()
         if date_str:
@@ -335,9 +482,7 @@ def parse_observation_date(header: fits.Header) -> tuple:
         return None, None, None
 
     try:
-        # Remove trailing Z if present; handle microseconds
-        clean = date_str.rstrip('Z').replace(' ', 'T')
-        dt = datetime.fromisoformat(clean)
+        dt = datetime.fromisoformat(date_str.rstrip('Z').replace(' ', 'T'))
         return date_str, dt.year, dt.month
     except ValueError:
         logger.warning(f"Could not parse observation date: '{date_str}'")
@@ -345,15 +490,15 @@ def parse_observation_date(header: fits.Header) -> tuple:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main extraction function
+# Known headers (anything else → unknown_headers + surprises.log)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Headers we know about - anything else goes to unknown_headers and surprises.log
 _KNOWN_HEADERS: frozenset = frozenset({
     'SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'NAXIS3', 'EXTEND',
     'BZERO', 'BSCALE',
-    'TELESCOP', 'TELESCOPE', 'INSTRUME', 'INSTRUMENT', 'CREATOR', 'PRODUCER',
-    'ORIGIN', 'OBJECT', 'RA', 'DEC',
+    'TELESCOP', 'TELESCOPE', 'INSTRUME', 'INSTRUMENT',
+    'CREATOR', 'PRODUCER', 'ORIGIN',
+    'OBJECT', 'RA', 'DEC',
     'EXPTIME', 'EXPOSURE', 'EXP_TIME', 'GAIN',
     'FILTER', 'DATE-OBS', 'DATE_OBS', 'DATEOBS',
     'DET-TEMP', 'CCD-TEMP', 'CCDTEMP', 'SET-TEMP',
@@ -367,13 +512,16 @@ _KNOWN_HEADERS: frozenset = frozenset({
 })
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main extraction function
+# ──────────────────────────────────────────────────────────────────────────────
+
 def extract_metadata(fits_path: Path) -> FITSMetadata:
     """
-    Extract all available metadata from a FITS file.
+    Extract all available metadata from a single FITS file.
 
-    Safe to call on any file - errors are captured into the returned
-    FITSMetadata object rather than raised, so a batch scan can continue
-    past bad files.
+    Safe for batch use — errors are captured in the returned FITSMetadata
+    rather than raised, so a directory scan continues past bad files.
     """
     meta = FITSMetadata(
         file_path=str(fits_path),
@@ -388,7 +536,7 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
         return meta
 
     if fits_path.suffix not in FITS_EXTENSIONS:
-        msg = f"Unexpected file extension '{fits_path.suffix}' — attempting to read anyway."
+        msg = f"Unexpected extension '{fits_path.suffix}' — attempting to read anyway."
         meta.warnings.append(msg)
         logger.warning(msg)
 
@@ -397,8 +545,14 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             header = hdul[0].header
 
             # ── Device ────────────────────────────────────────────────────────
-            meta.device_type, dev_w = detect_device(header)
+            meta.device_type, dev_w = detect_device(header, fits_path)
             meta.warnings.extend(dev_w)
+            meta.device_source = (
+                'header'     if not dev_w and meta.device_type != 'UNKNOWN' else
+                'path'       if not dev_w and meta.device_type != 'UNKNOWN' else
+                'dimensions' if dev_w and 'image size' in (dev_w[0] if dev_w else '') else
+                'unknown'
+            )
 
             meta.telescope   = str(header.get('TELESCOP',  header.get('TELESCOPE',  ''))).strip()
             meta.instrument  = str(header.get('INSTRUME',  header.get('INSTRUMENT', ''))).strip()
@@ -406,16 +560,15 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             meta.firmware    = str(header.get('FIRMWARE',  '')).strip()
             meta.mac_address = str(header.get('MACADDR',   '')).strip()
 
-            # Unique per-instrument ID for tracking individual scopes
             if meta.mac_address:
                 meta.device_id = f"{meta.device_type}_{meta.mac_address[-6:]}"
             elif meta.telescope.upper().startswith('S50_'):
-                meta.device_id = meta.telescope          # e.g. S50_40d24ed8
+                meta.device_id = meta.telescope
             else:
                 meta.device_id = meta.device_type
 
             # ── Frame type ────────────────────────────────────────────────────
-            meta.frame_type, cls_w = classify_frame(header)
+            meta.frame_type, cls_w = classify_frame(header, fits_path.name)
             meta.warnings.extend(cls_w)
 
             # ── Target ────────────────────────────────────────────────────────
@@ -428,7 +581,7 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             except (ValueError, TypeError):
                 pass
 
-            # ── Capture parameters ────────────────────────────────────────────
+            # ── Capture parameters from headers ───────────────────────────────
             meta.exposure_time = get_exposure(header)
             meta.temperature   = get_temperature(header)
             meta.filter_name   = str(header.get('FILTER', '')).strip()
@@ -438,13 +591,25 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             except (ValueError, TypeError):
                 pass
 
+            # ── Fill missing capture params from filename (calibration files) ─
+            # Dark/bias/flat filenames carry exposure, gain, temp even when
+            # the FITS header does not.
+            if meta.frame_type in ('DARK', 'BIAS', 'FLAT'):
+                cal = parse_calibration_filename(fits_path.name)
+                if meta.exposure_time is None and 'exposure_time' in cal:
+                    meta.exposure_time = cal['exposure_time']
+                if meta.gain is None and 'gain' in cal:
+                    meta.gain = cal['gain']
+                if meta.temperature is None and 'temperature' in cal:
+                    meta.temperature = cal['temperature']
+
             # ── Image properties ──────────────────────────────────────────────
             for attr, key in (('image_width',  'NAXIS1'),
                                ('image_height', 'NAXIS2'),
                                ('bit_depth',    'BITPIX')):
                 try:
                     val = header.get(key)
-                    setattr(meta, attr, int(val) if val else None)
+                    setattr(meta, attr, int(val) if val is not None else None)
                 except (ValueError, TypeError):
                     pass
 
@@ -454,13 +619,14 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
                                ('pixel_size_y', 'YPIXSZ')):
                 try:
                     val = header.get(key)
-                    setattr(meta, attr, float(val) if val else None)
+                    setattr(meta, attr, float(val) if val is not None else None)
                 except (ValueError, TypeError):
                     pass
 
             # ── Date / Time ───────────────────────────────────────────────────
-            meta.observation_date, meta.observation_year, meta.observation_month = \
-                parse_observation_date(header)
+            (meta.observation_date,
+             meta.observation_year,
+             meta.observation_month) = parse_observation_date(header)
 
             # ── Location (Seestar) ────────────────────────────────────────────
             try:
@@ -471,12 +637,13 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             except (ValueError, TypeError):
                 pass
 
-            # ── Unknown headers → surprises.log ──────────────────────────────
+            # ── Catch unknown headers → surprises.log ─────────────────────────
             for key in header.keys():
                 if key.upper() not in _KNOWN_HEADERS:
                     val = str(header[key])
                     meta.unknown_headers[key] = val
-                    logger.info(f"Unknown header [{fits_path.name}] {key} = {val}")
+                    logger.info(
+                        f"Unknown header [{fits_path.name}] {key} = {val}")
 
     except Exception as exc:
         meta.is_valid = False
@@ -492,9 +659,9 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
 
 def scan_directory(root_path: Path, recursive: bool = True) -> list:
     """
-    Recursively scan a directory and extract metadata from every FITS file.
+    Scan a directory tree and extract metadata from every FITS file.
     Handles mixed structures: Year/Month, Year/Device, Year/Device/Month, etc.
-    Continues past unreadable files (errors captured in each FITSMetadata).
+    Continues past unreadable files — errors captured per-file.
     """
     pattern = '**/*' if recursive else '*'
     fits_files = sorted(
@@ -514,48 +681,48 @@ def scan_directory(root_path: Path, recursive: bool = True) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Formatted report
+# Reports
 # ──────────────────────────────────────────────────────────────────────────────
 
 def format_report(meta: FITSMetadata) -> str:
     """Human-readable single-file report."""
-    W = 62
-    sep  = '─' * W
-    line = lambda label, val: f"  {label:<18}{val}"
+    W   = 64
+    sep = '─' * W
+    ln  = lambda label, val: f"  {label:<20}{val}"
 
     rows = [
         '=' * W,
         f"  FILE:  {meta.file_name}",
         '=' * W,
-        line('Device',    f"{meta.device_type}  (id: {meta.device_id})"),
-        line('Frame type', meta.frame_type),
-        line('Target',     meta.object_name or '(none)'),
-        line('Date',       meta.observation_date or 'unknown'),
+        ln('Device',      f"{meta.device_type}  (id: {meta.device_id})"),
+        ln('Detected via', meta.device_source or 'header'),
+        ln('Frame type',  meta.frame_type),
+        ln('Target',      meta.object_name or '(none)'),
+        ln('Date',        meta.observation_date or 'unknown'),
         sep,
-        line('Exposure',   f"{meta.exposure_time}s" if meta.exposure_time is not None else 'unknown'),
-        line('Gain',       str(meta.gain)           if meta.gain          is not None else 'unknown'),
-        line('Filter',     meta.filter_name         or '(none)'),
-        line('Sensor temp', f"{meta.temperature}°C" if meta.temperature   is not None else 'unknown'),
+        ln('Exposure',    f"{meta.exposure_time}s" if meta.exposure_time is not None else 'unknown'),
+        ln('Gain',        str(meta.gain)            if meta.gain          is not None else 'unknown'),
+        ln('Filter',      meta.filter_name          or '(none)'),
+        ln('Sensor temp', f"{meta.temperature}°C"   if meta.temperature   is not None else 'unknown'),
         sep,
-        line('Image size',  f"{meta.image_width}×{meta.image_height} px"
-                            if meta.image_width else 'unknown'),
-        line('Bit depth',   f"{meta.bit_depth} bit" if meta.bit_depth else 'unknown'),
-        line('Bayer',       meta.bayer_pattern       or 'unknown'),
-        line('Focal length', f"{meta.focal_length}mm" if meta.focal_length else 'unknown'),
-        line('Pixel size',   f"{meta.pixel_size_x}µm" if meta.pixel_size_x else 'unknown'),
+        ln('Image size',  f"{meta.image_width}×{meta.image_height} px"
+                          if meta.image_width else 'unknown'),
+        ln('Bit depth',   f"{meta.bit_depth} bit"   if meta.bit_depth else 'unknown'),
+        ln('Bayer',       meta.bayer_pattern         or 'unknown'),
+        ln('Focal length', f"{meta.focal_length}mm"  if meta.focal_length else 'unknown'),
+        ln('Pixel size',   f"{meta.pixel_size_x}µm"  if meta.pixel_size_x else 'unknown'),
     ]
 
     if meta.firmware:
-        rows.append(line('Firmware', meta.firmware))
+        rows.append(ln('Firmware',    meta.firmware))
     if meta.mac_address:
-        rows.append(line('MAC address', meta.mac_address))
+        rows.append(ln('MAC address', meta.mac_address))
     if meta.site_latitude is not None:
-        rows.append(line('Location', f"{meta.site_latitude:.4f}°, {meta.site_longitude:.4f}°"))
-
+        rows.append(ln('Location',
+                       f"{meta.site_latitude:.4f}°, {meta.site_longitude:.4f}°"))
     if meta.warnings:
         rows += [sep, '  ⚠  WARNINGS:']
         rows += [f"     • {w}" for w in meta.warnings]
-
     if meta.unknown_headers:
         rows += [sep, '  🔍 UNKNOWN HEADERS (also in surprises.log):']
         rows += [f"     {k} = {v}" for k, v in meta.unknown_headers.items()]
@@ -565,7 +732,7 @@ def format_report(meta: FITSMetadata) -> str:
 
 
 def print_summary(results: list) -> None:
-    """Print aggregate statistics for a batch scan."""
+    """Aggregate statistics for a batch scan."""
     total   = len(results)
     valid   = sum(1 for r in results if r.is_valid)
     devices: dict = {}
@@ -581,15 +748,18 @@ def print_summary(results: list) -> None:
         if r.object_name:
             targets.add(r.object_name)
 
-    W = 62
+    W = 64
     print('\n' + '=' * W)
-    print(f"  SCAN SUMMARY")
+    print('  SCAN SUMMARY')
     print('=' * W)
-    print(f"  Total files : {total}  ({valid} valid, {total-valid} errors)")
+    print(f"  Total files : {total}  ({valid} valid, {total - valid} errors)")
     print(f"  Devices     : {dict(sorted(devices.items()))}")
     print(f"  Frame types : {dict(sorted(frames.items()))}")
     print(f"  Years       : {dict(sorted(years.items()))}")
-    print(f"  Targets     : {len(targets)} unique  {sorted(targets)}")
+    print(f"  Targets     : {len(targets)} unique")
+    if targets:
+        for t in sorted(targets):
+            print(f"    • {t}")
     print('=' * W)
 
 
@@ -605,22 +775,19 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single file report
+  # Single file
   python fits_metadata_extractor.py /path/to/file.fits
 
-  # Scan entire astrophotography root
-  python fits_metadata_extractor.py ~/Astronomy/Astrocapture --scan
+  # Scan a full year directory
+  python fits_metadata_extractor.py ~/Astronomy/Astrocapture/2026 --scan --summary
 
-  # Summary statistics only
-  python fits_metadata_extractor.py ~/Astronomy/Astrocapture --scan --summary
-
-  # JSON output (for piping to other scripts)
-  python fits_metadata_extractor.py ~/Astronomy/Astrocapture --scan --json
+  # JSON output for piping to other scripts
+  python fits_metadata_extractor.py ~/Astronomy/Astrocapture/2026 --scan --json
         """
     )
-    parser.add_argument('path',    help='FITS file or root directory to scan')
-    parser.add_argument('--scan',  action='store_true', help='Scan directory recursively')
-    parser.add_argument('--json',  action='store_true', help='Output as JSON')
+    parser.add_argument('path',      help='FITS file or root directory')
+    parser.add_argument('--scan',    action='store_true', help='Scan directory recursively')
+    parser.add_argument('--json',    action='store_true', help='Output as JSON')
     parser.add_argument('--summary', action='store_true', help='Summary statistics only')
     args = parser.parse_args()
 
@@ -629,7 +796,8 @@ Examples:
     if target.is_dir() or args.scan:
         results = scan_directory(target)
         if args.json:
-            print(json.dumps([asdict(r) for r in results], indent=2, default=str))
+            import json as _json
+            print(_json.dumps([asdict(r) for r in results], indent=2, default=str))
         elif args.summary:
             print_summary(results)
         else:
@@ -639,7 +807,8 @@ Examples:
     else:
         meta = extract_metadata(target)
         if args.json:
-            print(json.dumps(asdict(meta), indent=2, default=str))
+            import json as _json
+            print(_json.dumps(asdict(meta), indent=2, default=str))
         else:
             print(format_report(meta))
 
