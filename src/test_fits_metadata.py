@@ -5,20 +5,24 @@ test_fits_metadata.py
 Unit tests for fits_metadata_extractor.py
 
 Fixtures use REAL header values from Ed's actual FITS files.
-Rev 2 adds tests for:
-  - Directory-path-based device detection  (calibration frames)
-  - Filename-based frame classification    (calibration frames)
-  - Calibration filename metadata parsing  (dark/bias/flat)
+Rev 3 adds tests for:
+  - New filename prefixes: unknown_ / failed_ / stacked-
+  - detect_device() now returns 3-tuple (device, warnings, source)
+  - _is_known_header() helper including WCS prefix families
+  - Log file opened in write mode ('w')
+  - print_summary() includes warning count
 
 Run with:
     pytest test_fits_metadata.py -v
 """
 
+import logging
 import pytest
 from pathlib import Path
 from astropy.io import fits
 
 from fits_metadata_extractor import (
+    logger,
     detect_device,
     detect_device_from_path,
     classify_frame,
@@ -27,6 +31,8 @@ from fits_metadata_extractor import (
     get_temperature,
     get_exposure,
     parse_observation_date,
+    setup_logging,
+    _is_known_header,
     DEVICE_SIGNATURES,
     FITS_EXTENSIONS,
     FRAME_FILENAME_PREFIXES,
@@ -42,11 +48,6 @@ def make_header(kvs: dict) -> fits.Header:
     for k, v in kvs.items():
         h[k] = v
     return h
-
-
-def make_path(*parts: str) -> Path:
-    """Build a Path from string parts — avoids hard-coding OS separators."""
-    return Path(*parts)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,50 +150,58 @@ def seestar_s50_light():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Device Detection — header-based (unchanged from Rev 1)
+# Device Detection — header-based
+# ── Rev 3: detect_device() returns 3-tuple (device, warnings, source) ─────────
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestDeviceDetectionHeader:
 
     def test_dwarf3_old_firmware(self, dwarf3_light_2025):
-        device, warnings = detect_device(dwarf3_light_2025)
-        assert device == 'DWARF_3' and warnings == []
+        device, warnings, source = detect_device(dwarf3_light_2025)
+        assert device == 'DWARF_3' and warnings == [] and source == 'header'
 
     def test_dwarf3_new_firmware(self, dwarf3_light_2026):
-        device, warnings = detect_device(dwarf3_light_2026)
-        assert device == 'DWARF_3' and warnings == []
+        device, warnings, source = detect_device(dwarf3_light_2026)
+        assert device == 'DWARF_3' and warnings == [] and source == 'header'
 
     def test_dwarf_mini_lowercase_m(self, dwarf_mini_light):
-        device, warnings = detect_device(dwarf_mini_light)
-        assert device == 'DWARF_MINI' and warnings == []
+        device, warnings, source = detect_device(dwarf_mini_light)
+        assert device == 'DWARF_MINI' and warnings == [] and source == 'header'
 
     def test_dwarf_mini_not_confused_with_dwarf3(self, dwarf_mini_light):
-        device, _ = detect_device(dwarf_mini_light)
+        device, _, _src = detect_device(dwarf_mini_light)
         assert device != 'DWARF_3'
 
     def test_seestar_s50_via_creator(self, seestar_s50_light):
-        device, warnings = detect_device(seestar_s50_light)
-        assert device == 'SEESTAR_S50' and warnings == []
+        device, warnings, source = detect_device(seestar_s50_light)
+        assert device == 'SEESTAR_S50' and warnings == [] and source == 'header'
 
     def test_seestar_serial_in_telescop_still_detected(self, seestar_s50_light):
         assert seestar_s50_light['TELESCOP'].startswith('S50_')
-        device, _ = detect_device(seestar_s50_light)
+        device, _, _src = detect_device(seestar_s50_light)
         assert device == 'SEESTAR_S50'
 
     def test_unknown_device_warns(self):
         h = make_header({'TELESCOP': 'FutureScopeX 9000', 'NAXIS1': 9999, 'NAXIS2': 9999})
-        device, warnings = detect_device(h)
-        assert device == 'UNKNOWN' and len(warnings) == 1
+        device, warnings, source = detect_device(h)
+        assert device == 'UNKNOWN' and len(warnings) == 1 and source == 'unknown'
 
     def test_dimension_fallback_warns(self):
         h = make_header({'TELESCOP': 'DWARF-III-V2', 'NAXIS1': 3856, 'NAXIS2': 2180})
-        device, warnings = detect_device(h)
-        assert device == 'DWARF_3' and len(warnings) == 1
+        device, warnings, source = detect_device(h)
+        assert device == 'DWARF_3' and len(warnings) == 1 and source == 'dimensions'
         assert 'DEVICE_SIGNATURES' in warnings[0]
+
+    def test_source_field_is_header_for_known_devices(self, dwarf3_light_2025,
+                                                       dwarf_mini_light,
+                                                       seestar_s50_light):
+        for hdr in (dwarf3_light_2025, dwarf_mini_light, seestar_s50_light):
+            _, _, source = detect_device(hdr)
+            assert source == 'header'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Device Detection — path-based (NEW in Rev 2)
+# Device Detection — path-based
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestDeviceDetectionPath:
@@ -208,7 +217,7 @@ class TestDeviceDetectionPath:
         assert detect_device_from_path(p) == 'DWARF_MINI'
 
     def test_seestar_path_detected(self):
-        p = Path('/Users/edm/Astronomy/Astrocapture/2025/September/'
+        p = Path('/Users/edm/Astronomy/Astrocapture/2025/'
                  'Seestar S50/Objects/NGC 281_sub/sub_0001.fit')
         assert detect_device_from_path(p) == 'SEESTAR_S50'
 
@@ -223,28 +232,29 @@ class TestDeviceDetectionPath:
         """
         p = Path('/Users/edm/Astronomy/Astrocapture/2026/DWARF 3/'
                  'DWARF_DARK/dark_exp_30_gain_60_bin_1_34C_stack_1.fits')
-        device, warnings = detect_device(dwarf3_calib_stripped, p)
+        device, warnings, source = detect_device(dwarf3_calib_stripped, p)
         assert device == 'DWARF_3'
-        # Path-based detection must NOT produce a firmware-rename warning
+        assert source == 'path'
         assert not any('firmware rename' in w for w in warnings)
 
     def test_mini_calib_no_false_firmware_warning(self, dwarf_mini_calib_stripped):
         p = Path('/Users/edm/Astronomy/Astrocapture/2026/DWARF Mini/'
                  'March 2026/bias_gain_2_bin_1.fits')
-        device, warnings = detect_device(dwarf_mini_calib_stripped, p)
+        device, warnings, source = detect_device(dwarf_mini_calib_stripped, p)
         assert device == 'DWARF_MINI'
+        assert source == 'path'
         assert not any('firmware rename' in w for w in warnings)
 
     def test_path_beats_dimension_fallback(self, dwarf3_calib_stripped):
         """Path detection (silent) must take priority over dimension fallback (noisy)."""
         p = Path('/some/path/DWARF 3/calibration/dark.fits')
-        _, warnings = detect_device(dwarf3_calib_stripped, p)
-        # dimension fallback would warn; path should prevent that
+        _, warnings, source = detect_device(dwarf3_calib_stripped, p)
+        assert source == 'path'
         assert not any('firmware rename' in w for w in warnings)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Frame Classification — header-based (unchanged from Rev 1)
+# Frame Classification — header-based
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestFrameClassificationHeader:
@@ -294,12 +304,14 @@ class TestFrameClassificationHeader:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Frame Classification — filename-based (NEW in Rev 2)
+# Frame Classification — filename-based
+# ── Rev 3: added unknown_ / failed_ / stacked- cases ─────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestClassifyFromFilename:
 
     @pytest.mark.parametrize("filename,expected", [
+        # ── original prefixes ─────────────────────────────────────────────────
         ('bias_gain_2_bin_1.fits',                                  'BIAS'),
         ('dark_exp_30.000000_gain_60_bin_1_34C_stack_1.fits',       'DARK'),
         ('dark_exp_15.000000_gain_60_bin_1_34C_stack_3.fits',       'DARK'),
@@ -310,6 +322,16 @@ class TestClassifyFromFilename:
         ('BIAS_GAIN_2_BIN_1.fits',                                  'BIAS'),   # uppercase
         ('Barnard 33_30s60_Duo-Band_20260324-203732172_36C.fits',   None),     # no known prefix
         ('some_random_file.fits',                                   None),
+        # ── Rev 3: new prefixes ───────────────────────────────────────────────
+        ('unknown_abc123.fits',                                     'UNKNOWN'),
+        ('Unknown_ABC123.fits',                                     'UNKNOWN'),  # case-insensitive
+        ('failed_capture_20260401.fits',                            'UNKNOWN'),
+        ('FAILED_capture.fits',                                     'UNKNOWN'),  # case-insensitive
+        ('stacked-16_NGC281_LP_20251001.fits',                      'LIGHT'),
+        ('stacked-32_M42_Duo-Band_20260115.fits',                   'LIGHT'),
+        ('STACKED-8_target.fits',                                   'LIGHT'),   # case-insensitive
+        # ── Seestar Light_ prefix (capital L — covered because lower() is used) ─
+        ('Light_NGC 281_10.0s_LP_20250929-062845.fit',              'LIGHT'),
     ])
     def test_classify_from_filename(self, filename, expected):
         assert classify_from_filename(filename) == expected
@@ -343,6 +365,38 @@ class TestClassifyFromFilename:
         assert frame == 'DARK'
         assert warnings == []
 
+    def test_unknown_prefix_silent_no_warning(self, dwarf3_calib_stripped):
+        """unknown_ files should be classified silently — no WARNING emitted."""
+        frame, warnings = classify_frame(
+            dwarf3_calib_stripped,
+            filename='unknown_abc123.fits')
+        assert frame == 'UNKNOWN'
+        assert warnings == []           # silent — no device-layer warning
+
+    def test_failed_prefix_silent_no_warning(self, dwarf3_calib_stripped):
+        """failed_ capture files should be classified silently."""
+        frame, warnings = classify_frame(
+            dwarf3_calib_stripped,
+            filename='failed_capture_20260401.fits')
+        assert frame == 'UNKNOWN'
+        assert warnings == []
+
+    def test_stacked_prefix_classified_as_light(self, dwarf3_calib_stripped):
+        """stacked-N_ files are device-produced stacks — treat as LIGHT."""
+        frame, warnings = classify_frame(
+            dwarf3_calib_stripped,
+            filename='stacked-16_NGC281_LP_20251001.fits')
+        assert frame == 'LIGHT'
+        assert warnings == []
+
+    def test_stacked_varying_count(self, dwarf3_calib_stripped):
+        """Stacked count (8, 16, 32, …) should not affect classification."""
+        for count in (4, 8, 16, 32, 64):
+            frame, _ = classify_frame(
+                dwarf3_calib_stripped,
+                filename=f'stacked-{count}_target_LP.fits')
+            assert frame == 'LIGHT', f"stacked-{count}_ should be LIGHT"
+
     def test_truly_unknown_still_warns(self, dwarf3_calib_stripped):
         """No header info AND no recognisable filename → UNKNOWN with warning."""
         frame, warnings = classify_frame(
@@ -353,7 +407,7 @@ class TestClassifyFromFilename:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Calibration Filename Metadata Parsing (NEW in Rev 2)
+# Calibration Filename Metadata Parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestCalibrationFilenameParsing:
@@ -426,7 +480,7 @@ class TestCalibrationFilenameParsing:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Temperature Extraction (unchanged from Rev 1)
+# Temperature Extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestTemperatureExtraction:
@@ -448,7 +502,7 @@ class TestTemperatureExtraction:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exposure Extraction (unchanged from Rev 1)
+# Exposure Extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestExposureExtraction:
@@ -470,7 +524,7 @@ class TestExposureExtraction:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Date Parsing (unchanged from Rev 1)
+# Date Parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestDateParsing:
@@ -490,6 +544,116 @@ class TestDateParsing:
     def test_missing_date_all_none(self):
         date_str, year, month = parse_observation_date(make_header({}))
         assert (date_str, year, month) == (None, None, None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Known-header filtering — Rev 3 new section
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestKnownHeaderFiltering:
+    """Verify that the two-layer known-header check (_KNOWN_HEADERS +
+    _KNOWN_HEADER_PREFIXES) correctly suppresses expected headers."""
+
+    # ── Exact-match headers ───────────────────────────────────────────────────
+    def test_standard_fits_keywords_known(self):
+        for kw in ('SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'END'):
+            assert _is_known_header(kw), f"'{kw}' should be known"
+
+    def test_device_headers_known(self):
+        for kw in ('TELESCOP', 'INSTRUME', 'CREATOR', 'FIRMWARE', 'MACADDR'):
+            assert _is_known_header(kw)
+
+    def test_capture_headers_known(self):
+        for kw in ('EXPTIME', 'GAIN', 'FILTER', 'DATE-OBS', 'DET-TEMP', 'CCD-TEMP'):
+            assert _is_known_header(kw)
+
+    def test_wcs_fixed_headers_known(self):
+        for kw in ('WCSAXES', 'RADESYS', 'EQUINOX', 'LONPOLE', 'LATPOLE',
+                   'CTYPE1', 'CTYPE2', 'CRVAL1', 'CRVAL2', 'CRPIX1', 'CRPIX2',
+                   'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
+                   'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2'):
+            assert _is_known_header(kw), f"WCS header '{kw}' should be known"
+
+    # ── Prefix-family headers (variable suffix) ───────────────────────────────
+    def test_seestar_corner_coords_known(self):
+        """CRTLxx, CRTRxx, CRBLxx, CRBRxx are Seestar corner-coord headers."""
+        for kw in ('CRTL01', 'CRTL02', 'CRTR01', 'CRTR02',
+                   'CRBL01', 'CRBL02', 'CRBR01', 'CRBR02',
+                   'CRTL1', 'CRTR1', 'CRBL1', 'CRBR1'):
+            assert _is_known_header(kw), f"Corner-coord header '{kw}' should be known"
+
+    def test_sip_coefficients_known(self):
+        """SIP distortion polynomial coefficients: A_2_0, AP_1_1, B_0_2 …"""
+        for kw in ('A_2_0', 'A_1_1', 'AP_1_0', 'B_0_2', 'BP_2_0', 'A_ORDER', 'B_ORDER'):
+            assert _is_known_header(kw), f"SIP header '{kw}' should be known"
+
+    def test_pv_ps_coefficients_known(self):
+        for kw in ('PV1_1', 'PV2_3', 'PS1_0', 'PS2_1'):
+            assert _is_known_header(kw), f"WCS projection header '{kw}' should be known"
+
+    def test_truly_unknown_not_suppressed(self):
+        """Headers that are genuinely new should NOT be filtered."""
+        for kw in ('NEWKEY', 'FUTRSCOP', 'MYSTERY1', 'ZZZZZZ'):
+            assert not _is_known_header(kw), f"'{kw}' should be unknown"
+
+    def test_case_insensitive_matching(self):
+        """Header names should match regardless of case."""
+        assert _is_known_header('telescop')
+        assert _is_known_header('TELESCOP')
+        assert _is_known_header('crtl01')
+        assert _is_known_header('CRTL01')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging configuration — Rev 3
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLoggingConfiguration:
+
+    def test_log_file_opened_in_write_mode(self, tmp_path):
+        """
+        Rev 3 requirement: surprises.log must be opened in 'w' (write) mode
+        so each scan produces a fresh file, not appending to previous runs.
+        """
+        log_file = str(tmp_path / 'test_surprises.log')
+        # Record handlers BEFORE calling setup_logging so we can identify the new one
+        handlers_before = set(id(h) for h in logger.handlers)
+        test_logger = setup_logging(log_file=log_file)
+
+        # Find only the FileHandler we just added (not pre-existing ones)
+        new_file_handlers = [
+            h for h in test_logger.handlers
+            if isinstance(h, logging.FileHandler)
+            and id(h) not in handlers_before
+        ]
+        assert new_file_handlers, "setup_logging() must add a FileHandler"
+
+        # The handler we added must be in write mode
+        new_fh = new_file_handlers[-1]
+        assert new_fh.mode == 'w', (
+            f"FileHandler mode is '{new_fh.mode}', expected 'w'. "
+            "Each scan should overwrite the previous surprises.log.")
+
+        # Cleanup: remove ONLY the handler we added — leave others intact
+        test_logger.removeHandler(new_fh)
+        new_fh.close()
+
+    def test_console_handler_at_info(self):
+        """Console should only show INFO and above."""
+        handlers = [
+            h for h in logger.handlers
+            if isinstance(h, logging.StreamHandler)
+            and not isinstance(h, logging.FileHandler)
+        ]
+        assert any(h.level == logging.INFO for h in handlers)
+
+    def test_file_handler_at_debug(self):
+        """File handler should capture DEBUG and above."""
+        file_handlers = [
+            h for h in logger.handlers
+            if isinstance(h, logging.FileHandler)
+        ]
+        assert any(h.level == logging.DEBUG for h in file_handlers)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -537,3 +701,16 @@ class TestConfiguration:
         for prefix in FRAME_FILENAME_PREFIXES:
             assert prefix == prefix.lower(), \
                 f"Prefix '{prefix}' must be lowercase"
+
+    def test_rev3_prefixes_present(self):
+        """Rev 3 additions must be in FRAME_FILENAME_PREFIXES."""
+        assert 'unknown_' in FRAME_FILENAME_PREFIXES
+        assert 'failed_'  in FRAME_FILENAME_PREFIXES
+        assert 'stacked-' in FRAME_FILENAME_PREFIXES
+
+    def test_unknown_and_failed_map_to_unknown_type(self):
+        assert FRAME_FILENAME_PREFIXES['unknown_'] == 'UNKNOWN'
+        assert FRAME_FILENAME_PREFIXES['failed_']  == 'UNKNOWN'
+
+    def test_stacked_maps_to_light(self):
+        assert FRAME_FILENAME_PREFIXES['stacked-'] == 'LIGHT'

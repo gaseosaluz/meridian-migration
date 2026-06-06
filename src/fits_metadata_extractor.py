@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 1 - Rev 2: calibration frame handling
+Sprint 2, Phase 1 - Rev 3: log hygiene + extended classification
 
 Validated against actual files from:
   - DWARF 3 (firmware pre-1.4  / TELESCOP='DWARFIII')
@@ -14,14 +14,23 @@ Validated against actual files from:
   - DWARF Mini (firmware 1.0.25.2 / TELESCOP='DWARF mini')
   - Seestar S50 (CREATOR='ZWO Seestar S50')
 
-Rev 2 changes:
-  - Calibration frames (bias/dark/flat) have stripped FITS headers on DWARF.
-    Added two new fallback strategies so they no longer flood surprises.log:
-      1. Directory-path detection  — reads device name from folder structure
-      2. Filename-based classification — reads frame type from filename prefix
-  - Dark/bias/flat filenames also carry exposure, gain, and temperature;
-    these are now extracted and stored for use by the dark-matching engine
-    in Phase 4.
+Rev 3 changes:
+  - Log file now opened in WRITE mode ('w') so each run produces a fresh
+    surprises.log.  Append mode caused old entries to accumulate across runs,
+    making it hard to tell which scan produced which output.
+  - Three new filename prefixes recognised (no WARNING, just silent DEBUG):
+      unknown_  → UNKNOWN  (device-internal unclassified frames)
+      failed_   → UNKNOWN  (capture-failure frames recorded by the device)
+      stacked-  → LIGHT    (device-produced stacks, e.g. stacked-16_…)
+  - WCS / astrometric headers no longer flagged as unknown:
+      Standard : WCSAXES, CTYPE*, CRVAL*, CRPIX*, CDELT*, CUNIT*, PC*_*,
+                 CD*_*, PV*_*, PS*_*, LONPOLE, LATPOLE, RADESYS, EQUINOX,
+                 A_*, B_*, AP_*, BP_*, SIP coefficients, etc.
+      Custom   : CRTL*, CRTR*, CRBL*, CRBR* (corner-coordinate headers
+                 written by Seestar firmware, variable suffix)
+  - detect_device() now returns a 3-tuple (device, warnings, source) so the
+    extraction layer can record exactly how the device was identified.
+  - print_summary() reports total WARNING count.
 """
 
 import re
@@ -81,15 +90,20 @@ DEVICE_SIGNATURES: dict = {
 # All FITS file extensions we will process
 FITS_EXTENSIONS: frozenset = frozenset({'.fits', '.fit', '.FITS', '.FIT'})
 
-# Filename prefixes that unambiguously identify calibration frame types.
+# Filename prefixes that unambiguously identify frame types.
 # Key = lowercase prefix, Value = frame type string.
 # Longer prefixes must come before shorter ones if they share a stem.
+# ── Rev 3: added unknown_ / failed_ / stacked- ───────────────────────────────
 FRAME_FILENAME_PREFIXES: dict = {
-    'bias_':  'BIAS',
-    'dark_':  'DARK',
-    'flat_':  'FLAT',
-    'raw_':   'DARK',    # DWARF individual dark sub-frames
-    'light_': 'LIGHT',   # Seestar light sub-frames
+    'bias_':    'BIAS',
+    'dark_':    'DARK',
+    'flat_':    'FLAT',
+    'raw_':     'DARK',     # DWARF individual dark sub-frames
+    'light_':   'LIGHT',    # Seestar light sub-frames
+    # Rev 3 additions — no WARNING produced; classified silently
+    'unknown_': 'UNKNOWN',  # Device-internal unclassified frames
+    'failed_':  'UNKNOWN',  # Capture-failure frames recorded by device
+    'stacked-': 'LIGHT',    # Device-stacked output, e.g. stacked-16_…
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,7 +137,8 @@ def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
       File    : DEBUG and above (full detail including path-based detections)
 
     surprises.log is your early-warning system for firmware changes.
-    With Rev 2, calibration frames no longer flood it with false alarms.
+    Rev 3: opened in WRITE mode ('w') so each scan produces a fresh log.
+    Delete surprises.log manually only if you want to compare runs back-to-back.
     """
     logger = logging.getLogger('fits_extractor')
     logger.setLevel(logging.DEBUG)
@@ -138,7 +153,7 @@ def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
     logger.addHandler(ch)
 
     if log_file:
-        fh = logging.FileHandler(log_file, mode='a')
+        fh = logging.FileHandler(log_file, mode='w')   # Rev 3: 'a' → 'w'
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -305,11 +320,15 @@ def detect_device(header: fits.Header,
       2. Seestar serial pattern in TELESCOPE ('S50_...')
       3. CREATOR header
       4. INSTRUMENT header
-      5. Directory path  ← NEW: handles calibration frames with stripped headers
+      5. Directory path  ← handles calibration frames with stripped headers
       6. Image dimensions fallback (warns — possible firmware rename)
       7. UNKNOWN (warns — add to DEVICE_SIGNATURES)
 
-    Returns: (device_type: str, warnings: list[str])
+    Returns: (device_type: str, warnings: list[str], source: str)
+      source is one of: 'header' | 'path' | 'dimensions' | 'unknown'
+
+    Note: Rev 3 adds the 'source' third element.  Existing callers that unpack
+    two values will need to update to:  device, warnings, source = detect_device(…)
     """
     warnings: list = []
 
@@ -322,13 +341,13 @@ def detect_device(header: fits.Header,
     # ── Methods 1-4: FITS header ──────────────────────────────────────────────
     for device_name, sigs in DEVICE_SIGNATURES.items():
         if telescop and telescop in sigs.get('TELESCOPE', []):
-            return device_name, warnings
+            return device_name, warnings, 'header'
         if device_name == 'SEESTAR_S50' and telescop.upper().startswith('S50_'):
-            return device_name, warnings
+            return device_name, warnings, 'header'
         if creator and creator in sigs.get('CREATOR', []):
-            return device_name, warnings
+            return device_name, warnings, 'header'
         if instrument and instrument in sigs.get('INSTRUMENT', []):
-            return device_name, warnings
+            return device_name, warnings, 'header'
 
     # ── Method 5: directory path (calibration frames) ─────────────────────────
     if file_path is not None:
@@ -337,7 +356,7 @@ def detect_device(header: fits.Header,
             logger.debug(
                 f"[path-detect] {file_path.name} → {path_device} "
                 f"(calibration file with minimal headers — expected behaviour)")
-            return path_device, warnings
+            return path_device, warnings, 'path'
 
     # ── Method 6: image dimensions (warns — possible firmware rename) ─────────
     dim_map = {
@@ -352,7 +371,7 @@ def detect_device(header: fits.Header,
                f"possible firmware rename. Update DEVICE_SIGNATURES['TELESCOPE'].")
         warnings.append(msg)
         logger.warning(msg)
-        return device, warnings
+        return device, warnings, 'dimensions'
 
     # ── Method 7: truly unknown ───────────────────────────────────────────────
     msg = (f"UNKNOWN device — TELESCOP='{telescop}', INSTRUMENT='{instrument}', "
@@ -360,7 +379,7 @@ def detect_device(header: fits.Header,
            f"Check surprises.log and add to DEVICE_SIGNATURES if new device.")
     warnings.append(msg)
     logger.warning(msg)
-    return 'UNKNOWN', warnings
+    return 'UNKNOWN', warnings, 'unknown'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -376,7 +395,7 @@ def classify_frame(header: fits.Header,
       1. IMAGETYP header (Seestar provides this; DWARF does not)
       2. OBJECT header populated → LIGHT  (DWARF light frames)
       3. OBJECT empty + RA≈0 + DEC≈0 → DARK  (DWARF dark frames)
-      4. Filename prefix  ← NEW: bias_/dark_/flat_/raw_/light_
+      4. Filename prefix  ← bias_/dark_/flat_/raw_/light_/unknown_/failed_/stacked-
       5. UNKNOWN (logged to surprises.log)
 
     Returns: (frame_type: str, warnings: list[str])
@@ -415,7 +434,7 @@ def classify_frame(header: fits.Header,
     except (ValueError, TypeError):
         pass
 
-    # ── Method 4: filename prefix (calibration frames with stripped headers) ──
+    # ── Method 4: filename prefix (calibration + device-special frames) ───────
     if filename is not None:
         ft = classify_from_filename(filename)
         if ft is not None:
@@ -491,25 +510,71 @@ def parse_observation_date(header: fits.Header) -> tuple:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Known headers (anything else → unknown_headers + surprises.log)
+#
+# Rev 3: two layers —
+#   _KNOWN_HEADERS         : exact header names (frozenset lookup, O(1))
+#   _KNOWN_HEADER_PREFIXES : variable-suffix headers (prefix check, O(n) short)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _KNOWN_HEADERS: frozenset = frozenset({
+    # FITS structural
     'SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'NAXIS3', 'EXTEND',
     'BZERO', 'BSCALE',
+    # Device identification
     'TELESCOP', 'TELESCOPE', 'INSTRUME', 'INSTRUMENT',
     'CREATOR', 'PRODUCER', 'ORIGIN',
+    # Target / pointing
     'OBJECT', 'RA', 'DEC',
+    # Capture parameters
     'EXPTIME', 'EXPOSURE', 'EXP_TIME', 'GAIN',
     'FILTER', 'DATE-OBS', 'DATE_OBS', 'DATEOBS',
-    'DET-TEMP', 'CCD-TEMP', 'CCDTEMP', 'SET-TEMP',
+    # Temperature
+    'DET-TEMP', 'CCD-TEMP', 'CCDTEMP', 'TEMPERAT', 'SET-TEMP',
+    # Optics / sensor geometry
     'BAYERPAT', 'FOCALLEN', 'XPIXSZ', 'YPIXSZ',
     'XBINNING', 'YBINNING', 'CCDXBIN', 'CCDYBIN',
-    'IMAGETYP', 'SITELAT', 'SITELONG', 'SITEELEV',
-    'FIRMWARE', 'MACADDR', 'EQMODE', 'PROGRAM',
-    'RESTACK', 'CAMERA', 'STACKCNT', 'TOTALEXP',
-    'FOCUSPOS', 'APERTURE', 'XORGSUBF', 'YORGSUBF',
+    'XORGSUBF', 'YORGSUBF', 'APERTURE',
+    # Frame classification
+    'IMAGETYP',
+    # Site / location
+    'SITELAT', 'SITELONG', 'SITEELEV',
+    # Device metadata
+    'FIRMWARE', 'MACADDR', 'EQMODE', 'PROGRAM', 'CAMERA',
+    # Stacking / processing
+    'RESTACK', 'STACKCNT', 'TOTALEXP', 'FOCUSPOS',
+    # Standard WCS (astrometry solve headers)
+    'WCSAXES', 'RADESYS', 'EQUINOX', 'LONPOLE', 'LATPOLE',
+    'CTYPE1', 'CTYPE2', 'CRVAL1', 'CRVAL2',
+    'CRPIX1', 'CRPIX2', 'CDELT1', 'CDELT2',
+    'CUNIT1', 'CUNIT2',
+    'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
+    'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2',
+    # FITS bookkeeping
     'COMMENT', 'HISTORY', 'END',
 })
+
+# Variable-suffix header families (matched by prefix, case-insensitive).
+# Used for WCS headers that embed axis/coefficient indices in their names,
+# and for Seestar corner-coordinate headers.
+_KNOWN_HEADER_PREFIXES: frozenset = frozenset({
+    # Standard WCS axis-indexed headers: CRPIXn, CTYPEn, CDELTn …
+    'CRPIX', 'CRVAL', 'CTYPE', 'CDELT', 'CUNIT',
+    # WCS matrix terms: PC1_1, CD1_1, PV2_3 …
+    'PC', 'PV', 'PS',
+    # SIP distortion polynomial coefficients: A_2_0, AP_1_1 …
+    'A_', 'B_', 'AP', 'BP',
+    # Seestar corner-coordinate headers: CRTLxx, CRTRxx, CRBLxx, CRBRxx
+    'CRTL', 'CRTR', 'CRBL', 'CRBR',
+})
+
+
+def _is_known_header(key: str) -> bool:
+    """Return True if the header key is expected and should not be reported."""
+    key_upper = key.upper()
+    if key_upper in _KNOWN_HEADERS:
+        return True
+    return any(key_upper.startswith(prefix.upper())
+               for prefix in _KNOWN_HEADER_PREFIXES)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -545,14 +610,9 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             header = hdul[0].header
 
             # ── Device ────────────────────────────────────────────────────────
-            meta.device_type, dev_w = detect_device(header, fits_path)
+            meta.device_type, dev_w, meta.device_source = detect_device(
+                header, fits_path)
             meta.warnings.extend(dev_w)
-            meta.device_source = (
-                'header'     if not dev_w and meta.device_type != 'UNKNOWN' else
-                'path'       if not dev_w and meta.device_type != 'UNKNOWN' else
-                'dimensions' if dev_w and 'image size' in (dev_w[0] if dev_w else '') else
-                'unknown'
-            )
 
             meta.telescope   = str(header.get('TELESCOP',  header.get('TELESCOPE',  ''))).strip()
             meta.instrument  = str(header.get('INSTRUME',  header.get('INSTRUMENT', ''))).strip()
@@ -592,8 +652,6 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
                 pass
 
             # ── Fill missing capture params from filename (calibration files) ─
-            # Dark/bias/flat filenames carry exposure, gain, temp even when
-            # the FITS header does not.
             if meta.frame_type in ('DARK', 'BIAS', 'FLAT'):
                 cal = parse_calibration_filename(fits_path.name)
                 if meta.exposure_time is None and 'exposure_time' in cal:
@@ -639,7 +697,7 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
 
             # ── Catch unknown headers → surprises.log ─────────────────────────
             for key in header.keys():
-                if key.upper() not in _KNOWN_HEADERS:
+                if not _is_known_header(key):
                     val = str(header[key])
                     meta.unknown_headers[key] = val
                     logger.info(
@@ -735,6 +793,7 @@ def print_summary(results: list) -> None:
     """Aggregate statistics for a batch scan."""
     total   = len(results)
     valid   = sum(1 for r in results if r.is_valid)
+    warn_total = sum(len(r.warnings) for r in results)   # Rev 3: warning count
     devices: dict = {}
     frames:  dict = {}
     years:   dict = {}
@@ -753,6 +812,7 @@ def print_summary(results: list) -> None:
     print('  SCAN SUMMARY')
     print('=' * W)
     print(f"  Total files : {total}  ({valid} valid, {total - valid} errors)")
+    print(f"  Warnings    : {warn_total}  (see surprises.log for detail)")   # Rev 3
     print(f"  Devices     : {dict(sorted(devices.items()))}")
     print(f"  Frame types : {dict(sorted(frames.items()))}")
     print(f"  Years       : {dict(sorted(years.items()))}")
