@@ -7,6 +7,9 @@ Unit tests for fits_metadata_extractor.py
 Fixtures use REAL header values from Ed's actual FITS files.
 Rev 3 adds tests for:
   - New filename prefixes: unknown_ / failed_ / stacked-
+  Rev 4:
+  - stacked_ prefix (Seestar format), IMAGEW/IMAGEH headers,
+    duplicate-handler guard for setup_logging()
   - detect_device() now returns 3-tuple (device, warnings, source)
   - _is_known_header() helper including WCS prefix families
   - Log file opened in write mode ('w')
@@ -332,6 +335,10 @@ class TestClassifyFromFilename:
         ('STACKED-8_target.fits',                                   'LIGHT'),   # case-insensitive
         # ── Seestar Light_ prefix (capital L — covered because lower() is used) ─
         ('Light_NGC 281_10.0s_LP_20250929-062845.fit',              'LIGHT'),
+        # ── Rev 4: Seestar Stacked_N_ format (underscore separator) ─────────────
+        ('Stacked_492_M 57_10.0s_LP_20250825-010001.fit',           'LIGHT'),
+        ('Stacked_16_NGC 281_10.0s_LP_20251001-020000.fit',         'LIGHT'),
+        ('STACKED_8_target.fits',                                   'LIGHT'),   # case-insensitive
     ])
     def test_classify_from_filename(self, filename, expected):
         assert classify_from_filename(filename) == expected
@@ -603,6 +610,15 @@ class TestKnownHeaderFiltering:
         assert _is_known_header('crtl01')
         assert _is_known_header('CRTL01')
 
+    def test_rev4_imagew_imageh_known(self):
+        """Rev 4: Seestar non-standard dimension headers must not flood the log."""
+        assert _is_known_header('IMAGEW'), (
+            'IMAGEW should be in _KNOWN_HEADERS — Seestar writes it on every frame')
+        assert _is_known_header('IMAGEH'), (
+            'IMAGEH should be in _KNOWN_HEADERS — Seestar writes it on every frame')
+        assert _is_known_header('imagew')   # case-insensitive
+        assert _is_known_header('imageh')
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging configuration — Rev 3
@@ -614,29 +630,23 @@ class TestLoggingConfiguration:
         """
         Rev 3 requirement: surprises.log must be opened in 'w' (write) mode
         so each scan produces a fresh file, not appending to previous runs.
+
+        Rev 4 note: the dup-handler guard means a second call to setup_logging()
+        does NOT add a new FileHandler when one already exists, so we verify the
+        mode of the already-attached FileHandler rather than adding a fresh one.
         """
-        log_file = str(tmp_path / 'test_surprises.log')
-        # Record handlers BEFORE calling setup_logging so we can identify the new one
-        handlers_before = set(id(h) for h in logger.handlers)
-        test_logger = setup_logging(log_file=log_file)
-
-        # Find only the FileHandler we just added (not pre-existing ones)
-        new_file_handlers = [
-            h for h in test_logger.handlers
+        # The module-level setup_logging() call attached the initial FileHandler.
+        file_handlers = [
+            h for h in logger.handlers
             if isinstance(h, logging.FileHandler)
-            and id(h) not in handlers_before
         ]
-        assert new_file_handlers, "setup_logging() must add a FileHandler"
+        assert file_handlers, "Logger must have at least one FileHandler"
 
-        # The handler we added must be in write mode
-        new_fh = new_file_handlers[-1]
-        assert new_fh.mode == 'w', (
-            f"FileHandler mode is '{new_fh.mode}', expected 'w'. "
-            "Each scan should overwrite the previous surprises.log.")
-
-        # Cleanup: remove ONLY the handler we added — leave others intact
-        test_logger.removeHandler(new_fh)
-        new_fh.close()
+        # Every FileHandler attached by setup_logging() must use write mode.
+        for fh in file_handlers:
+            assert fh.mode == 'w', (
+                f"FileHandler mode is '{fh.mode}', expected 'w'. "
+                "Each scan should overwrite the previous surprises.log.")
 
     def test_console_handler_at_info(self):
         """Console should only show INFO and above."""
@@ -654,6 +664,25 @@ class TestLoggingConfiguration:
             if isinstance(h, logging.FileHandler)
         ]
         assert any(h.level == logging.DEBUG for h in file_handlers)
+
+    def test_rev4_no_duplicate_handlers(self, tmp_path):
+        """
+        Rev 4: calling setup_logging() a second time (as happens when
+        fits_migrator imports fits_metadata_extractor) must NOT add a
+        second pair of handlers to the shared logger.
+        """
+        log_file = str(tmp_path / 'dup_test.log')
+        count_before = len(logger.handlers)
+
+        # Call setup_logging a second time with the same logger name
+        setup_logging(log_file=log_file)
+        count_after = len(logger.handlers)
+
+        # Handler count must not have grown (guard must have suppressed duplicates)
+        assert count_after == count_before, (
+            f"setup_logging() added {count_after - count_before} duplicate "
+            f"handler(s) on a second call. Expected 0 additions "
+            f"(had {count_before}, now {count_after}).")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -708,9 +737,19 @@ class TestConfiguration:
         assert 'failed_'  in FRAME_FILENAME_PREFIXES
         assert 'stacked-' in FRAME_FILENAME_PREFIXES
 
+    def test_rev4_stacked_underscore_prefix_present(self):
+        """Rev 4: Seestar 'stacked_' prefix must be registered."""
+        assert 'stacked_' in FRAME_FILENAME_PREFIXES, (
+            "'stacked_' must be in FRAME_FILENAME_PREFIXES so that Seestar "
+            "Stacked_N_… files are recognised as LIGHT frames")
+
     def test_unknown_and_failed_map_to_unknown_type(self):
         assert FRAME_FILENAME_PREFIXES['unknown_'] == 'UNKNOWN'
         assert FRAME_FILENAME_PREFIXES['failed_']  == 'UNKNOWN'
 
     def test_stacked_maps_to_light(self):
         assert FRAME_FILENAME_PREFIXES['stacked-'] == 'LIGHT'
+
+    def test_stacked_underscore_maps_to_light(self):
+        """Rev 4: stacked_ (Seestar) must also map to LIGHT."""
+        assert FRAME_FILENAME_PREFIXES['stacked_'] == 'LIGHT'

@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 1 - Rev 3: log hygiene + extended classification
+Sprint 2, Phase 1 - Rev 4: Seestar stacked_ prefix + IMAGEW/H + dup-handler guard
 
 Validated against actual files from:
   - DWARF 3 (firmware pre-1.4  / TELESCOP='DWARFIII')
@@ -28,6 +28,19 @@ Rev 3 changes:
                  A_*, B_*, AP_*, BP_*, SIP coefficients, etc.
       Custom   : CRTL*, CRTR*, CRBL*, CRBR* (corner-coordinate headers
                  written by Seestar firmware, variable suffix)
+
+Rev 4 changes:
+  - Added 'stacked_' prefix → LIGHT in FRAME_FILENAME_PREFIXES.
+    Seestar S50 names device stacks 'Stacked_N_Target_…' (capital S,
+    underscore separator) whereas DWARF uses 'stacked-N_…' (hyphen).
+    Both now route to Finals/Device/ via _is_device_stack().
+  - Added IMAGEW, IMAGEH to _KNOWN_HEADERS so Seestar's non-standard
+    dimension headers no longer flood the log.
+  - setup_logging() now guards against duplicate handlers.  When
+    fits_migrator.py imports this module the module-level setup_logging()
+    call would add a second pair of handlers to the shared logger,
+    causing every message to appear twice.  The guard skips adding a
+    handler type that is already attached.
   - detect_device() now returns a 3-tuple (device, warnings, source) so the
     extraction layer can record exactly how the device was identified.
   - print_summary() reports total WARNING count.
@@ -93,7 +106,7 @@ FITS_EXTENSIONS: frozenset = frozenset({'.fits', '.fit', '.FITS', '.FIT'})
 # Filename prefixes that unambiguously identify frame types.
 # Key = lowercase prefix, Value = frame type string.
 # Longer prefixes must come before shorter ones if they share a stem.
-# ── Rev 3: added unknown_ / failed_ / stacked- ───────────────────────────────
+# ── Rev 3: added unknown_ / failed_ / stacked-   Rev 4: added stacked_ ────────
 FRAME_FILENAME_PREFIXES: dict = {
     'bias_':    'BIAS',
     'dark_':    'DARK',
@@ -103,7 +116,8 @@ FRAME_FILENAME_PREFIXES: dict = {
     # Rev 3 additions — no WARNING produced; classified silently
     'unknown_': 'UNKNOWN',  # Device-internal unclassified frames
     'failed_':  'UNKNOWN',  # Capture-failure frames recorded by device
-    'stacked-': 'LIGHT',    # Device-stacked output, e.g. stacked-16_…
+    'stacked-': 'LIGHT',    # DWARF device-stacked output, e.g. stacked-16_…
+    'stacked_': 'LIGHT',    # Seestar device-stacked output, e.g. Stacked_492_M57_…  # Rev 4
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,16 +161,25 @@ def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
         '%(asctime)s [%(levelname)-8s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    # Rev 4: Guard against duplicate handlers when this module is imported
+    # by fits_migrator.py (both call setup_logging at module level).
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    )
+    if not has_stream:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
     if log_file:
-        fh = logging.FileHandler(log_file, mode='w')   # Rev 3: 'a' → 'w'
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if not has_file:
+            fh = logging.FileHandler(log_file, mode='w')   # Rev 3: 'a' → 'w'
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
 
     return logger
 
@@ -395,7 +418,7 @@ def classify_frame(header: fits.Header,
       1. IMAGETYP header (Seestar provides this; DWARF does not)
       2. OBJECT header populated → LIGHT  (DWARF light frames)
       3. OBJECT empty + RA≈0 + DEC≈0 → DARK  (DWARF dark frames)
-      4. Filename prefix  ← bias_/dark_/flat_/raw_/light_/unknown_/failed_/stacked-
+      4. Filename prefix  ← bias_/dark_/flat_/raw_/light_/unknown_/failed_/stacked-/stacked_
       5. UNKNOWN (logged to surprises.log)
 
     Returns: (frame_type: str, warnings: list[str])
@@ -534,6 +557,8 @@ _KNOWN_HEADERS: frozenset = frozenset({
     'BAYERPAT', 'FOCALLEN', 'XPIXSZ', 'YPIXSZ',
     'XBINNING', 'YBINNING', 'CCDXBIN', 'CCDYBIN',
     'XORGSUBF', 'YORGSUBF', 'APERTURE',
+    # Seestar non-standard image-dimension headers (Rev 4)
+    'IMAGEW', 'IMAGEH',
     # Frame classification
     'IMAGETYP',
     # Site / location

@@ -10,7 +10,7 @@ Tests cover:
   - plan_migration()     : filter logic and action building
   - execute_plan()       : dry-run validation and live copy (via tmp_path)
   - _make_unique_dest()  : conflict avoidance
-  - _is_device_stack()   : stacked-N_ detection
+  - _is_device_stack()   : stacked-N_ detection (Rev 2: adds stacked_N_ for Seestar)
 
 All tests are self-contained — no real FITS files required.
 FITSMetadata instances are built directly from the dataclass.
@@ -121,18 +121,42 @@ class TestSanitizeName:
 class TestIsDeviceStack:
 
     @pytest.mark.parametrize("filename,expected", [
-        ('stacked-16_NGC281_LP.fits',  True),
-        ('stacked-32_M42.fit',         True),
-        ('stacked-8_target.fits',      True),
-        ('STACKED-4_file.fits',        True),   # case-insensitive
-        ('stacked-1_x.fits',           True),
-        ('light_NGC281.fits',          False),
-        ('Barnard 33_30s.fits',        False),
-        ('dark_exp_30.fits',           False),
-        ('unknown_abc.fits',           False),
+        # ── DWARF format: stacked-N_ (hyphen, lowercase) ──────────────────
+        ('stacked-16_NGC281_LP.fits',                        True),
+        ('stacked-32_M42.fit',                               True),
+        ('stacked-8_target.fits',                            True),
+        ('STACKED-4_file.fits',                              True),   # case-insensitive
+        ('stacked-1_x.fits',                                 True),
+        # ── Seestar format: Stacked_N_ (underscore, any case) ─ Rev 2 ─────
+        ('Stacked_492_M 57_10.0s_LP_20250825-010001.fit',   True),
+        ('Stacked_16_NGC 281_10.0s_LP_20251001.fit',        True),
+        ('STACKED_8_target.fits',                            True),   # case-insensitive
+        ('stacked_1_x.fits',                                 True),   # lowercase
+        # ── Not device stacks ─────────────────────────────────────────────
+        ('light_NGC281.fits',                                False),
+        ('Barnard 33_30s.fits',                              False),
+        ('dark_exp_30.fits',                                 False),
+        ('unknown_abc.fits',                                 False),
     ])
     def test_detection(self, filename, expected):
         assert _is_device_stack(filename) == expected
+
+    def test_seestar_stacked_goes_to_finals_device(self):
+        """Rev 2: Seestar Stacked_N_Target_… must route to Finals/Device/, not Lights/."""
+        from pathlib import Path
+        seestar_name = 'Stacked_492_M 57_10.0s_LP_20250825-010001.fit'
+        meta = make_meta(
+            frame_type='LIGHT',
+            object_name='M 57',
+            observation_year=2025,
+            file_name=seestar_name,
+        )
+        dest = build_dest_path(meta, Path('/out'))
+        parts = dest.parts
+        assert FOLDER_FINALS      in parts, f'Expected Finals/ in {dest}'
+        assert FOLDER_DEVICE_STACK in parts, f'Expected Device/ in {dest}'
+        assert 'Lights' not in parts, (
+            f'Seestar stack should NOT go to Lights/, but got: {dest}')
 
 
 # ──────────────────────────────────────────────────────────────────────────────

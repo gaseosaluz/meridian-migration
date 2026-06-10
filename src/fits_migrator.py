@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 2 - Rev 1
+Sprint 2, Phase 2 - Rev 2
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
 files into the structure expected by Meridian (MacObservatory.com):
@@ -139,8 +139,14 @@ def _year_folder(meta: FITSMetadata) -> str:
 
 
 def _is_device_stack(filename: str) -> bool:
-    """True for device-produced stacked frames (e.g. stacked-16_…)."""
-    return filename.lower().startswith('stacked-')
+    """True for device-produced stacked frames.
+
+    Handles two naming conventions:
+      DWARF   : stacked-16_…   (lowercase, hyphen separator)  ← Rev 1
+      Seestar : Stacked_492_…  (any case, underscore separator) ← Rev 2
+    """
+    lower = filename.lower()
+    return lower.startswith('stacked-') or lower.startswith('stacked_')
 
 
 def build_dest_path(meta: FITSMetadata, output_root: Path) -> Path:
@@ -149,7 +155,7 @@ def build_dest_path(meta: FITSMetadata, output_root: Path) -> Path:
 
     Routing table:
       LIGHT (regular)       → Year/Target/Lights/
-      LIGHT (stacked-*)     → Year/Target/Finals/Device/
+      LIGHT (stacked-/stacked_) → Year/Target/Finals/Device/
       DARK/BIAS/FLAT        → Year/Target/Calibration/Type/  (has target)
                             → Year/_Calibration/Type/         (no target)
       UNKNOWN               → Year/Target/_Review/
