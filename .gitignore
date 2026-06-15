@@ -216,3 +216,39 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FITS Migrator 
+# ── Runtime logs (regenerated on every scan) ──────────────────────────────────
+surprises.log
+*.log
+
+# ── Migrator run captures / dry-run artifacts ─────────────────────────────────
+fits_migrator_*.txt
+fits_metadata_*.txt
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ── Test artifacts ────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Conda / virtual environments ──────────────────────────────────────────────
+.env
+.venv/
+
