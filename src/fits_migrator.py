@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Version 0.8.1 - see CHANGELOG.md
+Version 0.9.0 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -93,7 +93,7 @@ from fits_metadata_extractor import (
 )
 
 # One shared project version (must equal the extractor's; see RELEASING.md)
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 try:
     from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
 except ImportError:                                  # extractor older than 0.8.0
@@ -451,8 +451,35 @@ def _session_year(meta: FITSMetadata, session: Optional['SessionInfo']) -> str:
     return _year_folder(meta)
 
 
+def default_review_root(output_root: Path) -> Path:
+    """Where review material goes by default: a sibling folder of the output root.
+
+    Meridian scans EVERYTHING under a watched folder and counts those frames in
+    the target's frames and hours, so _Review must not sit inside it."""
+    output_root = Path(output_root)
+    return output_root.parent / f"{output_root.name}_Review"
+
+
+def _review_dir(output_root: Path, review_root: Optional[Path], year: str,
+                target: Optional[str], label: Optional[str] = None) -> Path:
+    """Folder for a frame that needs human review.
+
+    review_root None -> inside the tree:  <out>/Year/[Target/]_Review[/label]
+    review_root set  -> outside it:       <review_root>/Year/<Target>[/label]
+    """
+    if review_root is None:
+        base = output_root / year
+        if target:
+            base = base / target
+        base = base / FOLDER_REVIEW
+    else:
+        base = Path(review_root) / year / (target or '_NoTarget')
+    return base / label if label else base
+
+
 def build_dest_path(meta: FITSMetadata, output_root: Path,
-                    session: Optional[SessionInfo] = None) -> Path:
+                    session: Optional[SessionInfo] = None,
+                    review_root: Optional[Path] = None) -> Path:
     """
     Determine the destination directory for a single file.
 
@@ -468,6 +495,10 @@ def build_dest_path(meta: FITSMetadata, output_root: Path,
     (Lights/<label>/, Finals/Device/<label>/) or, for flagged sessions,
     _Review/<label>/.  With session=None the Rev 2 layout is used unchanged.
 
+    review_root: when given, frames that need review go to
+    <review_root>/Year/Target/[night]/ (outside the Meridian folder) instead
+    of <output_root>/Year/Target/_Review/.
+
     Returns the full destination path including filename.
     """
     year    = (_session_year(meta, session) if meta.frame_type == 'LIGHT'
@@ -480,13 +511,12 @@ def build_dest_path(meta: FITSMetadata, output_root: Path,
     problem = _frame_problem(meta)
 
     if ft == 'LIGHT' and session is not None and (session.review or problem):
-        folder = (output_root / year / (target or '_NoTarget')
-                  / FOLDER_REVIEW / session.label)
+        folder = _review_dir(output_root, review_root, year, target or '_NoTarget',
+                             session.label)
     elif problem and ft == 'LIGHT':                 # merged layout: no night folders
-        folder = output_root / year / (target or '_NoTarget') / FOLDER_REVIEW
+        folder = _review_dir(output_root, review_root, year, target or '_NoTarget')
     elif problem:                                   # damaged calibration frame
-        folder = (output_root / year / target / FOLDER_REVIEW
-                  if target else output_root / year / FOLDER_REVIEW)
+        folder = _review_dir(output_root, review_root, year, target)
     elif ft == 'LIGHT':
         if _is_device_stack(fname):
             folder = (output_root / year / (target or '_NoTarget')
@@ -507,11 +537,7 @@ def build_dest_path(meta: FITSMetadata, output_root: Path,
             folder = output_root / year / FOLDER_SHARED_CALIB / ft_cap
     else:
         # UNKNOWN frame type → quarantine for manual review
-        folder = (output_root / year / (target or '')
-                  / FOLDER_REVIEW).resolve()
-        # Flatten empty target segment
-        folder = (output_root / year / target / FOLDER_REVIEW
-                  if target else output_root / year / FOLDER_REVIEW)
+        folder = _review_dir(output_root, review_root, year, target)
 
     return folder / fname
 
@@ -604,7 +630,8 @@ def plan_migration(results:     list,
                    split_nights: bool  = True,
                    min_session_minutes: float = DEFAULT_MIN_SESSION_MINUTES,
                    tz_name: str = DEFAULT_TZ,
-                   target_filter=None) -> list:
+                   target_filter=None,
+                   review_root: Optional[Path] = None) -> list:
     """
     Build a migration plan from a list of FITSMetadata objects.
 
@@ -621,6 +648,8 @@ def plan_migration(results:     list,
                        False restores the Rev 2 merged layout.
         min_session_minutes: sessions with less total exposure go to _Review
         tz_name:       timezone used to convert Seestar UTC header times
+        review_root:   where frames needing review go (None = <output>/.../_Review,
+                       inside the tree; the CLI defaults to a folder OUTSIDE it)
         target_filter: Rev 4 — a target name or list of names (case-insensitive);
                        only those targets are planned (shared calibration
                        frames without a target are excluded)
@@ -670,7 +699,7 @@ def plan_migration(results:     list,
             continue
         meta = item
         session = sessions.get(session_key(meta)) if meta.frame_type == 'LIGHT' else None
-        dest = build_dest_path(meta, output_root, session)
+        dest = build_dest_path(meta, output_root, session, review_root)
 
         plan.append(MigrationAction(
             source=Path(meta.file_path), dest=dest,
@@ -767,6 +796,7 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
     # Rev 3 — night sessions and review flags
     sess_total: dict = {}
     sess_flags: dict = {}
+    sess_dirs: dict = {}
     for a in plan:
         if a.is_skip or not a.session:
             continue
@@ -775,6 +805,7 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
         if a.review_reason:
             flags = sess_flags.setdefault(k, {})
             flags[a.review_reason] = flags.get(a.review_reason, 0) + 1
+            sess_dirs[(k, a.review_reason)] = '/'.join(a.dest.parent.parts[-4:])
     if sess_total:
         # (night, reason) -> number of files carrying that reason.  Several capture
         # folders can share one night label, so never print the night's total here.
@@ -786,7 +817,7 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
               f"({len(whole)} session(s) flagged for review)")
         for (k, reason), n in sorted(whole.items()):
             year, target, device, label = k
-            print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
+            print(f"    ⚑ {sess_dirs[(k, reason)]}  [{device}]  "
                   f"{n} file(s) — {reason}")
         if failed:
             print(f"  Failed frames : {sum(failed.values())} moved to _Review "
@@ -795,7 +826,7 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
                 year, target, device, label = k
                 pct = 100 * n / sess_total[k]
                 note = '  — consider discarding that night' if pct >= 50 else ''
-                print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
+                print(f"    ⚑ {sess_dirs[(k, 'failed frame')]}  [{device}]  "
                       f"{n} failed ({pct:.0f}% of that night){note}")
     truncated = [a for a in plan if not a.is_skip and a.review_reason == 'truncated file']
     if truncated:
@@ -954,6 +985,13 @@ Examples:
     parser.add_argument('--target', action='append', metavar='NAME',
                         help='Only this target, e.g. --target "M 31" '
                              '(repeat for several; shared calibration is excluded)')
+    parser.add_argument('--review-root', metavar='PATH',
+                        help='Where review material goes (failed / truncated frames, '
+                             'aborted and Unknown sessions). Default: a folder next to '
+                             'the output folder, named <output>_Review. Do not watch it in Meridian.')
+    parser.add_argument('--review-in-tree', action='store_true',
+                        help='Put _Review folders inside the output tree (Meridian will '
+                             'count those frames in its totals)')
     parser.add_argument('--merge-nights', action='store_true',
                         help='Put all nights of a target in one folder (old behavior)')
     parser.add_argument('--min-session-minutes', type=float,
@@ -987,6 +1025,18 @@ Examples:
     if args.move and not args.execute:
         print("  ⚠  --move has no effect without --execute. Running dry-run.")
 
+    if args.review_in_tree:
+        review_root = None
+    else:
+        review_root = (Path(args.review_root).expanduser() if args.review_root
+                       else default_review_root(output_root))
+        try:
+            review_root.resolve().relative_to(output_root.resolve())
+            parser.error("--review-root must not be inside the output folder "
+                         "(Meridian would scan it)")
+        except ValueError:
+            pass
+
     log_path = attach_run_log(dry_run)
     if mismatch:
         logger.warning(mismatch)
@@ -996,6 +1046,7 @@ Examples:
     print(f"  Logs      : surprises.log (scan), {log_path.name} (plan / copy)")
     print(f"  Source    : {source_root}")
     print(f"  Output    : {output_root}")
+    print(f"  Review    : {review_root if review_root else 'inside the output tree (--review-in-tree)'}")
     if args.year:   print(f"  Year      : {args.year}")
     if args.device: print(f"  Device    : {args.device}")
     if args.target: print(f"  Target(s) : {', '.join(args.target)}")
@@ -1015,6 +1066,7 @@ Examples:
         min_session_minutes=args.min_session_minutes,
         tz_name=args.tz,
         target_filter=args.target,
+        review_root=review_root,
     )
 
     # ── Report ────────────────────────────────────────────────────────────────

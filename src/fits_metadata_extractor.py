@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Version 0.8.1 - see CHANGELOG.md
+Version 0.9.0 - see CHANGELOG.md
 Sprint 2, Phase 1 - Rev 8 (truncated-file detection); Rev 7 (one summary warning for implausible dates); Rev 6 (S30 Pro, implausible-date guard); Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # One shared project version for all files (bump together; see RELEASING.md).
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 
 def environment_line() -> str:

@@ -4,6 +4,18 @@ One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.p
 `session_report.py`). Versions bump together; see `RELEASING.md`.
 Dates were not recorded for 0.1.0 – 0.7.0.
 
+## [0.9.0] - 2026-10-12
+### Changed (default layout!)
+- Review material (failed / truncated frames, aborted and Unknown sessions, damaged
+  calibration frames) now goes OUTSIDE the Meridian folder, to `<output>_Review/Year/Target/<night>/`.
+  Reason: Meridian counts every frame under a watched folder (an M 31 test showed 18.6 h
+  and 3,231 frames including all of `_Review`; the usable total was about 15.6 h / 2,635).
+  Do NOT watch the review folder in Meridian.
+### Added
+- `--review-root PATH` to choose that folder; `--review-in-tree` for the old in-tree `_Review`.
+- The summary shows the real review folder; the header prints `Review :`.
+- Refuses a `--review-root` inside the output folder.
+
 ## [0.8.1] - 2026-10-12
 ### Fixed
 - The dry-run summary printed a night's TOTAL file count next to a flagged session

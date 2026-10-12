@@ -60,6 +60,7 @@ from fits_migrator import (
     version_banner,
     version_mismatch,
     attach_run_log,
+    default_review_root,
 )
 
 
@@ -1449,3 +1450,127 @@ class TestSummaryCountsFlaggedFilesOnly:
         print_summary(plan_migration([a, b], OUTPUT))
         out = capsys.readouterr().out
         assert 'session_a/flat_gain_2_bin_1_ir_0.fits' in out and 'session_b/flat_gain_2_bin_1_ir_0.fits' in out
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.9.0 — review material goes OUTSIDE the watched folder
+# (Meridian counts every frame under a watched folder, _Review included)
+# ══════════════════════════════════════════════════════════════════════════════
+REVIEW = Path('/output/Meridian_Review')
+
+
+def in_review(a):
+    return REVIEW in a.dest.parents
+
+
+class TestReviewRoot:
+    def test_default_review_root_is_a_sibling(self):
+        assert default_review_root(Path('/x/Meridian')) == Path('/x/Meridian_Review')
+        assert default_review_root(Path('/x/Meridian_Test')) == Path('/x/Meridian_Test_Review')
+
+    def test_failed_and_short_sessions_leave_the_tree(self):
+        ms = session_with_failed(good=40, failed=5)
+        ms += [lm('ab', '2026-03-02T20:00:00', exp=15.0, target='M 31') for _ in range(4)]   # aborted
+        plan = plan_migration(ms, OUTPUT, review_root=REVIEW)
+        for a in plan:
+            if in_review(a):
+                assert OUTPUT not in a.dest.parents
+        assert sum(in_review(a) for a in plan) == 5 + 4
+        assert not any(FOLDER_REVIEW in a.dest.parts for a in plan)       # no _Review inside the tree
+        assert sum(FOLDER_LIGHTS in a.dest.parts for a in plan) == 40
+
+    def test_review_layout_is_year_target_night(self):
+        plan = plan_migration(session_with_failed(good=40, failed=1), OUTPUT, review_root=REVIEW)
+        failed = [a for a in plan if in_review(a)][0]
+        assert failed.dest.parts[-4:] == ('2025', 'M 33', '2025-12-31_30s', failed.source.name)
+
+    def test_unknown_target_and_truncated_calibration_go_to_review_root(self):
+        ms = [lm('u', '2026-02-27T19:50:00', exp=30.0, target='Unknown(1)') for _ in range(60)]
+        d = lm('c', None, ftype='DARK', target='', name='dark_exp_10_gain_60_bin_1_33C_stack_3.fits')
+        d.truncated = True; d.observation_year = 2026
+        plan = plan_migration(ms + [d], OUTPUT, review_root=REVIEW)
+        assert all(in_review(a) for a in plan)
+        assert plan[-1].dest.parts[-3:-1] == ('2026', '_NoTarget')
+
+    def test_unknown_frame_type_goes_to_review_root(self):
+        u = lm('x', None, ftype='UNKNOWN', target='M 42', name='unknown_a.fits'); u.observation_year = 2026
+        assert in_review(plan_migration([u], OUTPUT, review_root=REVIEW)[0])
+
+    def test_merged_layout_also_uses_review_root(self):
+        plan = plan_migration(session_with_failed(), OUTPUT, split_nights=False, review_root=REVIEW)
+        assert sum(in_review(a) for a in plan) == 5
+
+    def test_default_none_keeps_review_inside_the_tree(self):
+        plan = plan_migration(session_with_failed(), OUTPUT)
+        assert sum(FOLDER_REVIEW in a.dest.parts and OUTPUT in a.dest.parents for a in plan) == 5
+
+    def test_stacks_of_flagged_session_also_leave(self):
+        ms = [lm('ab', '2026-03-02T20:00:00', exp=15.0, target='M 31') for _ in range(4)]
+        ms.append(lm('ab', '2026-03-02T20:10:00', name='stacked-4_M31.fits', target='M 31'))
+        assert all(in_review(a) for a in plan_migration(ms, OUTPUT, review_root=REVIEW))
+
+    def test_summary_shows_real_review_folder(self, capsys):
+        print_summary(plan_migration(session_with_failed(good=40, failed=5), OUTPUT, review_root=REVIEW))
+        out = capsys.readouterr().out
+        assert 'Meridian_Review/2025/M 33/2025-12-31_30s' in out and '5 failed' in out
+
+    def test_execute_writes_review_files_outside_and_rerun_is_safe(self, tmp_path):
+        out = tmp_path / 'Meridian'
+        rr = tmp_path / 'Meridian_Review'
+        ms = [real_meta(tmp_path, 'n1', f'good_{i}.fits', target='M 42', exp=60.0) for i in range(12)]
+        ms += [real_meta(tmp_path, 'n1', f'failed_M42_{i}.fits', target='M 42', exp=60.0) for i in range(3)]
+        plan = plan_migration(ms, out, review_root=rr)
+        s1 = execute_plan(plan, dry_run=False, output_root=out)
+        s2 = execute_plan(plan, dry_run=False, output_root=out)
+        assert s1['copied'] == 15 and s2['already_present'] == 15 and s2['copied'] == 0
+        assert len(list(rr.rglob('failed_*.fits'))) == 3
+        assert not list(out.rglob('failed_*')) and not list(out.rglob('_Review'))
+        assert len(list(out.rglob('good_*.fits'))) == 12
+
+
+class TestReviewRootCli:
+    def make_tree(self, tmp_path):
+        import numpy as np
+        from astropy.io import fits
+        d = tmp_path / '2026' / 'DWARF 3'
+        d.mkdir(parents=True)
+        for i in range(25):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 42'; h['EXPTIME'] = 60.0
+            h['DATE-OBS'] = f'2026-03-01T21:{i:02d}:00'; h['RA'] = 83.0; h['DEC'] = -5.0
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(d / f'good_{i}.fits')
+        for i in range(3):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 42'; h['EXPTIME'] = 60.0
+            h['DATE-OBS'] = f'2026-03-01T22:{i:02d}:00'; h['RA'] = 83.0; h['DEC'] = -5.0
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(d / f'failed_M 42_{i}.fits')
+        return tmp_path / '2026'
+
+    def run(self, tmp_path, *extra):
+        return subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'), str(self.make_tree(tmp_path)),
+                               str(tmp_path / 'Meridian'), '--execute', '--summary', *extra],
+                              capture_output=True, text=True, cwd=tmp_path,
+                              env={**__import__('os').environ, 'PYTHONPATH': str(HERE)})
+
+    def test_default_review_folder_is_outside(self, tmp_path):
+        r = self.run(tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert (tmp_path / 'Meridian_Review' / '2026' / 'M 42').exists()
+        assert len(list((tmp_path / 'Meridian_Review').rglob('failed_*'))) == 3
+        assert not list((tmp_path / 'Meridian').rglob('_Review'))
+        assert f"Review    : {tmp_path / 'Meridian_Review'}" in r.stdout
+
+    def test_review_in_tree_restores_old_layout(self, tmp_path):
+        r = self.run(tmp_path, '--review-in-tree')
+        assert r.returncode == 0, r.stderr
+        assert len(list((tmp_path / 'Meridian' / '2026' / 'M 42' / '_Review').rglob('failed_*'))) == 3
+        assert not (tmp_path / 'Meridian_Review').exists()
+
+    def test_custom_review_root(self, tmp_path):
+        r = self.run(tmp_path, '--review-root', str(tmp_path / 'ToCheck'))
+        assert r.returncode == 0, r.stderr
+        assert len(list((tmp_path / 'ToCheck').rglob('failed_*'))) == 3
+
+    def test_review_root_inside_output_is_refused(self, tmp_path):
+        r = self.run(tmp_path, '--review-root', str(tmp_path / 'Meridian' / 'Review'))
+        assert r.returncode != 0 and 'must not be inside the output folder' in r.stderr
+        assert not (tmp_path / 'Meridian').exists()
