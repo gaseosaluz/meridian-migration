@@ -49,6 +49,7 @@ from fits_migrator import (
     build_sessions,
     session_key,
     print_summary,
+    check_free_space,
 )
 
 
@@ -554,16 +555,22 @@ class TestExecutePlan:
         assert (out / '2025' / 'NGC 281' / 'Finals' / 'PixInsight').is_dir()
 
     def test_conflict_handled_without_overwrite(self, simple_plan):
-        """Running twice should not overwrite — second file gets _2 suffix."""
+        """
+        Rev 4: running twice must NOT duplicate (the second run sees the files
+        are already present).  A *different* file with the same destination name
+        still gets a _2 suffix and is never overwritten.
+        """
         plan, out = simple_plan
         execute_plan(plan, dry_run=False, output_root=out)
-        execute_plan(plan, dry_run=False, output_root=out)   # second run
+        s2 = execute_plan(plan, dry_run=False, output_root=out)      # second run
         lights_dir = out / '2025' / 'NGC 281' / 'Lights'
-        files = list(lights_dir.iterdir())
-        assert len(files) == 2
-        names = {f.name for f in files}
-        assert 'light.fits'   in names
-        assert 'light_2.fits' in names
+        assert [f.name for f in lights_dir.iterdir()] == ['light.fits']
+        assert s2['copied'] == 0 and s2['already_present'] >= 1
+
+        # a different file arriving at the same destination is kept, not overwritten
+        (lights_dir / 'light.fits').write_bytes(b'different content, different size')
+        execute_plan(plan, dry_run=False, output_root=out)
+        assert {f.name for f in lights_dir.iterdir()} == {'light.fits', 'light_2.fits'}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -891,3 +898,163 @@ class TestNightSplitExecute:
         assert (base / 'Finals' / 'PixInsight').is_dir()      # placeholders at Finals/ level
         assert (base / 'Finals' / 'Siril').is_dir()
         assert not (base / 'Finals' / 'Device' / '2025-08-05_30s' / 'PixInsight').exists()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 4 — --target filter, safe re-runs, disk-space safety
+# ══════════════════════════════════════════════════════════════════════════════
+import errno
+import os
+import shutil as _shutil
+from collections import namedtuple
+
+
+def real_meta(tmp_path, folder, name, target='M 31', ts='2025-08-05T22:00:00',
+              size=10, ftype='LIGHT', exp=30.0):
+    d = tmp_path / 'src' / folder
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_bytes(b'x' * size)
+    return make_meta(file_path=str(f), file_name=name, object_name=target,
+                     observation_date=ts, exposure_time=exp, observation_year=2025,
+                     frame_type=ftype)
+
+
+class TestTargetFilter:
+    def metas(self):
+        return [lm('a', '2025-08-05T22:00:00', target='M 31'),
+                lm('b', '2025-08-05T22:00:00', target='M 16'),
+                lm('c', '2025-08-05T22:00:00', target='NGC 281'),
+                lm('d', '2025-08-05T22:00:00', target='', ftype='DARK')]
+
+    def targets(self, plan):
+        return sorted({a.target for a in plan})
+
+    def test_single_target(self):
+        assert self.targets(plan_migration(self.metas(), OUTPUT, target_filter=['M 31'])) == ['M 31']
+
+    def test_string_accepted(self):
+        assert self.targets(plan_migration(self.metas(), OUTPUT, target_filter='M 16')) == ['M 16']
+
+    def test_multiple_targets(self):
+        plan = plan_migration(self.metas(), OUTPUT, target_filter=['m 31', 'M 16'])
+        assert self.targets(plan) == ['M 16', 'M 31']
+
+    def test_shared_calibration_excluded(self):
+        plan = plan_migration(self.metas(), OUTPUT, target_filter=['M 31'])
+        assert all(a.frame_type != 'DARK' for a in plan)
+
+    def test_no_filter_includes_everything(self):
+        assert len(plan_migration(self.metas(), OUTPUT)) == 4
+
+    def test_unknown_target_gives_empty_plan(self):
+        assert plan_migration(self.metas(), OUTPUT, target_filter=['M 999']) == []
+
+
+class TestSafeRerun:
+    def make(self, tmp_path, n=5):
+        return [real_meta(tmp_path, 'n1', f'f{i}.fits', size=100 + i) for i in range(n)]
+
+    def test_second_run_copies_nothing_and_makes_no_duplicates(self, tmp_path):
+        ms = self.make(tmp_path)
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        s1 = execute_plan(plan, dry_run=False, output_root=out)
+        s2 = execute_plan(plan, dry_run=False, output_root=out)
+        assert s1['copied'] == 5 and s1['already_present'] == 0
+        assert s2['copied'] == 0 and s2['already_present'] == 5
+        names = [p.name for p in out.rglob('*.fits')]
+        assert len(names) == 5 and not any('_2' in n for n in names)
+
+    def test_partial_first_run_is_completed(self, tmp_path):
+        ms = self.make(tmp_path)
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        execute_plan(plan[:2], dry_run=False, output_root=out)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['copied'] == 3 and s['already_present'] == 2
+
+    def test_different_file_same_name_still_gets_suffix(self, tmp_path):
+        ms = self.make(tmp_path, n=1)
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        dest = plan[0].dest
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b'something else entirely, different size')
+        execute_plan(plan, dry_run=False, output_root=out)
+        assert dest.exists() and (dest.parent / (dest.stem + '_2.fits')).exists()
+
+    def test_dry_run_reports_already_present(self, tmp_path):
+        ms = self.make(tmp_path)
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        execute_plan(plan, dry_run=False, output_root=out)
+        s = execute_plan(plan, dry_run=True)
+        assert s['already_present'] == 5 and s['copied'] == 0
+
+
+class TestDiskSpace:
+    Usage = namedtuple('Usage', 'total used free')
+
+    def test_fits_when_enough_space(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', f'f{i}.fits', size=1000) for i in range(3)]
+        plan = plan_migration(ms, tmp_path / 'out', min_session_minutes=0)
+        monkeypatch.setattr(_shutil, 'disk_usage', lambda p: self.Usage(0, 0, 10_000))
+        ok, needed, free = check_free_space(plan, tmp_path / 'out')
+        assert ok and needed == 3000 and free == 10_000
+
+    def test_refuses_when_not_enough_space(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', f'f{i}.fits', size=1000) for i in range(3)]
+        plan = plan_migration(ms, tmp_path / 'out', min_session_minutes=0)
+        monkeypatch.setattr(_shutil, 'disk_usage', lambda p: self.Usage(0, 0, 2_000))
+        assert check_free_space(plan, tmp_path / 'out')[0] is False
+
+    def test_already_copied_files_not_counted(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', f'f{i}.fits', size=1000) for i in range(3)]
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        execute_plan(plan[:2], dry_run=False, output_root=out)
+        monkeypatch.setattr(_shutil, 'disk_usage', lambda p: self.Usage(0, 0, 10_000))
+        assert check_free_space(plan, out)[1] == 1000
+
+    def test_move_needs_no_space(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', 'f0.fits', size=1000)]
+        plan = plan_migration(ms, tmp_path / 'out', operation='move', min_session_minutes=0)
+        monkeypatch.setattr(_shutil, 'disk_usage', lambda p: self.Usage(0, 0, 1))
+        assert check_free_space(plan, tmp_path / 'out')[1] == 0
+
+    def test_disk_full_stops_run_and_removes_partial(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', f'f{i}.fits', size=100) for i in range(5)]
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        real_copy = _shutil.copy2
+        calls = {'n': 0}
+
+        def flaky(src, dst, *a, **k):
+            calls['n'] += 1
+            if calls['n'] == 3:
+                open(dst, 'wb').write(b'partial')            # simulate half-written file
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real_copy(src, dst, *a, **k)
+
+        monkeypatch.setattr(_shutil, 'copy2', flaky)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['no_space'] is True and s['copied'] == 2 and calls['n'] == 3
+        assert len(list(out.rglob('*.fits'))) == 2            # partial removed, run stopped
+
+    def test_other_errors_do_not_stop_run(self, tmp_path, monkeypatch):
+        ms = [real_meta(tmp_path, 'n1', f'f{i}.fits', size=100) for i in range(4)]
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        real_copy = _shutil.copy2
+        calls = {'n': 0}
+
+        def flaky(src, dst, *a, **k):
+            calls['n'] += 1
+            if calls['n'] == 2:
+                raise PermissionError(errno.EACCES, 'denied')
+            return real_copy(src, dst, *a, **k)
+
+        monkeypatch.setattr(_shutil, 'copy2', flaky)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['errors'] == 1 and s['copied'] == 3 and s['no_space'] is False

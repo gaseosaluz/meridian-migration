@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 2 - Rev 3: per-night sessions
+Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
 files into the structure expected by Meridian (MacObservatory.com):
@@ -44,6 +44,16 @@ REV 3 - NIGHT SPLITTING (default):
     DWARF header times are already local.  Use --merge-nights for the old
     single-folder behavior.
 
+REV 4 - SAFETY:
+    * Re-running --execute into the same output folder no longer makes '_2'
+      duplicates: a destination file with the same size and timestamp is
+      reported as 'already present' and skipped.
+    * Before copying, the free disk space is checked; if the copy cannot fit
+      the run refuses to start.
+    * If the disk fills during a run, the run stops at once and the partial
+      file is removed.
+    * --target "M 31" (repeatable) limits the run to the named target(s).
+
 USAGE:
     # Dry-run (default — no files touched, shows what WOULD happen)
     python fits_migrator.py SOURCE_ROOT OUTPUT_ROOT --summary
@@ -61,6 +71,7 @@ USAGE:
 
 import re
 import sys
+import errno
 import shutil
 import logging
 from collections import Counter
@@ -412,6 +423,38 @@ def _make_unique_dest(dest: Path) -> Path:
         counter += 1
 
 
+def _same_file(source: Path, dest: Path) -> bool:
+    """True when dest already holds a copy of source (same size, same mtime +-2 s)."""
+    try:
+        s, d = source.stat(), dest.stat()
+    except OSError:
+        return False
+    return s.st_size == d.st_size and abs(s.st_mtime - d.st_mtime) <= 2
+
+
+def check_free_space(plan: list, output_root: Path, margin: float = 0.02):
+    """
+    Will a COPY of this plan fit on the output disk?
+    Returns (ok, needed_bytes, free_bytes).  Files already present are not
+    counted; 'move' operations need no extra space (assumes the same disk).
+    """
+    needed = 0
+    for a in plan:
+        if a.is_skip or a.operation != 'copy':
+            continue
+        if _same_file(a.source, a.dest):
+            continue
+        try:
+            needed += a.source.stat().st_size
+        except OSError:
+            pass
+    probe = Path(output_root)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free
+    return needed <= free * (1 - margin), needed, free
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Migration planner
 # ──────────────────────────────────────────────────────────────────────────────
@@ -423,7 +466,8 @@ def plan_migration(results:     list,
                    device_filter: Optional[str] = None,
                    split_nights: bool  = True,
                    min_session_minutes: float = DEFAULT_MIN_SESSION_MINUTES,
-                   tz_name: str = DEFAULT_TZ) -> list:
+                   tz_name: str = DEFAULT_TZ,
+                   target_filter=None) -> list:
     """
     Build a migration plan from a list of FITSMetadata objects.
 
@@ -440,7 +484,15 @@ def plan_migration(results:     list,
                        False restores the Rev 2 merged layout.
         min_session_minutes: sessions with less total exposure go to _Review
         tz_name:       timezone used to convert Seestar UTC header times
+        target_filter: Rev 4 — a target name or list of names (case-insensitive);
+                       only those targets are planned (shared calibration
+                       frames without a target are excluded)
     """
+    if isinstance(target_filter, str):
+        target_filter = [target_filter]
+    wanted = ({sanitize_name(t).lower() for t in target_filter}
+              if target_filter else None)
+
     entries: list = []      # ('skip', MigrationAction) | ('go', FITSMetadata)
 
     for meta in results:
@@ -450,6 +502,10 @@ def plan_migration(results:     list,
         if year_filter and _year_folder(meta) != year_filter:
             continue
         if device_filter and meta.device_type != device_filter.upper():
+            continue
+        if wanted is not None and (
+                not meta.object_name.strip()
+                or sanitize_name(meta.object_name).lower() not in wanted):
             continue
 
         # ── Skip unreadable files ─────────────────────────────────────────────
@@ -601,7 +657,8 @@ def execute_plan(plan:     list,
 
     Returns a stats dict: {'copied': N, 'moved': N, 'skipped': N, 'errors': N}
     """
-    stats = {'copied': 0, 'moved': 0, 'skipped': 0, 'errors': 0}
+    stats = {'copied': 0, 'moved': 0, 'skipped': 0, 'errors': 0,
+             'already_present': 0, 'no_space': False}
 
     # Create the PixInsight placeholder so users see it immediately
     if not dry_run and output_root is not None:
@@ -619,13 +676,21 @@ def execute_plan(plan:     list,
             if not action.source.exists():
                 logger.warning(f"DRY-RUN: source missing: {action.source}")
                 stats['errors'] += 1
+            elif action.operation == 'copy' and _same_file(action.source, action.dest):
+                stats['already_present'] += 1
             else:
                 key = 'copied' if action.operation == 'copy' else 'moved'
                 stats[key] = stats.get(key, 0) + 1
             continue
 
         # ── Live execution ────────────────────────────────────────────────────
+        dest = None
         try:
+            if action.operation == 'copy' and _same_file(action.source, action.dest):
+                stats['already_present'] += 1
+                logger.debug(f"PRESENT {action.dest}  (already copied, skipped)")
+                continue
+
             dest = _make_unique_dest(action.dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -638,6 +703,17 @@ def execute_plan(plan:     list,
                 stats['moved'] += 1
                 logger.debug(f"MOVE  {action.source}  →  {dest}")
 
+        except OSError as exc:
+            stats['errors'] += 1
+            if exc.errno == errno.ENOSPC:
+                if dest is not None:
+                    dest.unlink(missing_ok=True)      # remove the partial file
+                stats['no_space'] = True
+                logger.error("DISK FULL — stopping. Partial file removed. "
+                             "Free some space and re-run the same command: "
+                             "files already copied will be skipped.")
+                break
+            logger.error(f"ERROR {action.operation} {action.source}: {exc}")
         except Exception as exc:
             stats['errors'] += 1
             logger.error(f"ERROR {action.operation} {action.source}: {exc}")
@@ -703,6 +779,9 @@ Examples:
                         help='Move files instead of copying (requires --execute)')
     parser.add_argument('--year',      help='Only migrate files from this year, e.g. 2025')
     parser.add_argument('--device',    help='Only migrate files from this device, e.g. SEESTAR_S50')
+    parser.add_argument('--target', action='append', metavar='NAME',
+                        help='Only this target, e.g. --target "M 31" '
+                             '(repeat for several; shared calibration is excluded)')
     parser.add_argument('--merge-nights', action='store_true',
                         help='Put all nights of a target in one folder (old behavior)')
     parser.add_argument('--min-session-minutes', type=float,
@@ -737,6 +816,7 @@ Examples:
     print(f"  Output    : {output_root}")
     if args.year:   print(f"  Year      : {args.year}")
     if args.device: print(f"  Device    : {args.device}")
+    if args.target: print(f"  Target(s) : {', '.join(args.target)}")
     print(f"  Nights    : {'MERGED (old layout)' if args.merge_nights else 'SPLIT per night, tz ' + args.tz}")
 
     # ── Scan ──────────────────────────────────────────────────────────────────
@@ -752,6 +832,7 @@ Examples:
         split_nights=not args.merge_nights,
         min_session_minutes=args.min_session_minutes,
         tz_name=args.tz,
+        target_filter=args.target,
     )
 
     # ── Report ────────────────────────────────────────────────────────────────
@@ -759,15 +840,29 @@ Examples:
         print_plan(plan, verbose=args.verbose)
     print_summary(plan, dry_run=dry_run)
 
+    # ── Free-space check (copy mode only) ─────────────────────────────────────
+    if not dry_run and operation == 'copy':
+        ok, needed, free = check_free_space(plan, output_root)
+        gb = 1024 ** 3
+        print(f"\n  Space needed : {needed / gb:,.1f} GB   free: {free / gb:,.1f} GB")
+        if not ok:
+            print("  ✗  Not enough free space for this copy — nothing was copied.")
+            print("     Free some space, or limit the run with --target / --year.")
+            sys.exit(2)
+
     # ── Execute ───────────────────────────────────────────────────────────────
     stats = execute_plan(plan, dry_run=dry_run, output_root=output_root)
 
     if not dry_run:
         print(f"\n  Done — copied: {stats.get('copied', 0)}, "
+              f"already present: {stats.get('already_present', 0)}, "
               f"moved: {stats.get('moved', 0)}, "
               f"skipped: {stats['skipped']}, "
               f"errors: {stats['errors']}")
-        if stats['errors']:
+        if stats.get('no_space'):
+            print("  ✗  DISK FULL — run stopped. Free space and re-run the same command; "
+                  "files already copied are skipped.")
+        elif stats['errors']:
             print("  ⚠  Errors occurred — check migration.log")
 
 
