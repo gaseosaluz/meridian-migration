@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 1 - Rev 4: Seestar stacked_ prefix + IMAGEW/H + dup-handler guard
+Sprint 2, Phase 1 - Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
   - DWARF 3 (firmware pre-1.4  / TELESCOP='DWARFIII')
@@ -559,6 +559,8 @@ _KNOWN_HEADERS: frozenset = frozenset({
     'XORGSUBF', 'YORGSUBF', 'APERTURE',
     # Seestar non-standard image-dimension headers (Rev 4)
     'IMAGEW', 'IMAGEH',
+    # Seestar wide-angle camera flag (Rev 5): WIDECAM = 0 means main camera
+    'WIDECAM',
     # Frame classification
     'IMAGETYP',
     # Site / location

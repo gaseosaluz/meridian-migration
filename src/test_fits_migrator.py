@@ -41,6 +41,14 @@ from fits_migrator import (
     FOLDER_SHARED_CALIB,
     FOLDER_REVIEW,
     MigrationAction,
+    FOLDER_UNKNOWN_DATE,
+    parse_filename_time,
+    local_capture_time,
+    night_label,
+    normalize_session_folder,
+    build_sessions,
+    session_key,
+    print_summary,
 )
 
 
@@ -588,7 +596,7 @@ class TestIntegration:
             ))
 
         out = tmp_path / 'meridian'
-        plan = plan_migration(results, out)
+        plan = plan_migration(results, out, split_nights=False)
         stats = execute_plan(plan, dry_run=False, output_root=out)
 
         assert stats['errors'] == 0
@@ -602,3 +610,284 @@ class TestIntegration:
         # Finals/ placeholders for post-processing tools
         assert (out / '2025' / 'NGC 281' / 'Finals' / 'PixInsight').is_dir()
         assert (out / '2025' / 'NGC 281' / 'Finals' / 'Siril').is_dir()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 3 — night splitting
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import datetime
+
+
+def lm(folder, ts, name=None, device='DWARF_3', exp=15.0, target='M 31',
+       ftype='LIGHT', n=[0]):
+    """Light-frame metadata inside a named capture folder."""
+    n[0] += 1
+    name = name or f'frame_{n[0]:05d}.fits'
+    return make_meta(
+        file_path=f'/src/2025/{folder}/{name}', file_name=name,
+        device_type=device, frame_type=ftype, object_name=target,
+        observation_date=ts, exposure_time=exp, observation_year=2025)
+
+
+def night(plan_item):
+    return plan_item.dest.parent.name
+
+
+class TestFilenameTime:
+    @pytest.mark.parametrize('name,expected', [
+        ('Light_M 16_10.0s_LP_20250806-213920.fit',           datetime(2025, 8, 6, 21, 39, 20)),
+        ('Stacked_1_M 16_10.0s_LP_20250806-213920.fit',       datetime(2025, 8, 6, 21, 39, 20)),
+        ('Barnard 33_30s60_Duo-Band_20260324-203732172_36C.fits', datetime(2026, 3, 24, 20, 37, 32)),
+        ('stacked-16_NGC281_LP.fits',                          None),
+        ('light_NGC 281_10.0s_LP_20251399-250000.fit',         None),   # impossible date
+    ])
+    def test_parse(self, name, expected):
+        assert parse_filename_time(name) == expected
+
+
+class TestNightLabel:
+    @pytest.mark.parametrize('ts,expected', [
+        (datetime(2025, 8, 5, 23, 6),   '2025-08-05'),
+        (datetime(2025, 8, 6, 0, 51),   '2025-08-05'),   # after midnight -> previous evening
+        (datetime(2025, 8, 6, 11, 59),  '2025-08-05'),
+        (datetime(2025, 8, 6, 12, 0),   '2025-08-06'),
+        (datetime(2025, 1, 1, 0, 30),   '2024-12-31'),   # year boundary
+    ])
+    def test_evening_convention(self, ts, expected):
+        assert night_label(ts) == expected
+
+
+class TestLocalCaptureTime:
+    def test_seestar_prefers_filename_time(self):
+        m = lm('f', '2025-08-07T02:39:20', device='SEESTAR_S50',
+               name='Light_M 16_10.0s_LP_20250806-213920.fit')
+        t, conflict = local_capture_time(m)
+        assert t == datetime(2025, 8, 6, 21, 39, 20) and not conflict
+
+    def test_seestar_header_utc_converted_summer(self):
+        m = lm('f', '2025-08-07T02:39:20', device='SEESTAR_S50', name='frame.fit')
+        assert local_capture_time(m)[0] == datetime(2025, 8, 6, 21, 39, 20)   # CDT = UTC-5
+
+    def test_seestar_header_utc_converted_winter(self):
+        m = lm('f', '2025-12-07T03:39:20', device='SEESTAR_S50', name='frame.fit')
+        assert local_capture_time(m)[0] == datetime(2025, 12, 6, 21, 39, 20)  # CST = UTC-6
+
+    def test_seestar_conflict_when_header_is_already_local(self):
+        # firmware starts writing local time in the header -> disagrees with UTC conversion
+        m = lm('f', '2025-08-06T21:39:20', device='SEESTAR_S50',
+               name='Light_M 16_10.0s_LP_20250806-213920.fit')
+        t, conflict = local_capture_time(m)
+        assert conflict and t == datetime(2025, 8, 6, 21, 39, 20)
+
+    def test_seestar_stack_not_flagged_as_conflict(self):
+        # stack filename time is when it was saved, hours after DATE-OBS
+        m = lm('f', '2025-08-07T02:00:00', device='SEESTAR_S50',
+               name='Stacked_492_M 57_10.0s_LP_20250806-233001.fit')
+        assert local_capture_time(m)[1] is False
+
+    def test_dwarf_header_is_local_no_conversion(self):
+        m = lm('f', '2025-07-29T00:51:00')
+        assert local_capture_time(m)[0] == datetime(2025, 7, 29, 0, 51)
+
+    def test_dwarf_falls_back_to_filename(self):
+        m = lm('f', None, name='Barnard 33_30s60_Duo-Band_20260324-203732172_36C.fits')
+        assert local_capture_time(m)[0] == datetime(2026, 3, 24, 20, 37, 32)
+
+    def test_no_time_anywhere(self):
+        assert local_capture_time(lm('f', None))[0] is None
+
+
+class TestSessionFolder:
+    def test_sub_stripped(self):
+        assert normalize_session_folder('M 16_sub Seestar 50') == 'M 16 Seestar 50'
+        assert normalize_session_folder('M 16 Seestar 50') == 'M 16 Seestar 50'
+        assert normalize_session_folder('M 16_SUB') == 'M 16'
+
+    def test_sub_and_stack_folder_same_session(self):
+        a = lm('M 16_sub Seestar 50', '2025-08-07T02:38:00', device='SEESTAR_S50')
+        b = lm('M 16 Seestar 50',     '2025-08-07T02:39:00', device='SEESTAR_S50')
+        assert session_key(a) == session_key(b)
+
+    def test_different_folders_different_sessions(self):
+        assert session_key(lm('n1', '2025-08-06T22:00:00')) != session_key(lm('n2', '2025-08-07T22:00:00'))
+
+
+class TestNightSplitPlan:
+    def run(self, metas, **kw):
+        return plan_migration(metas, OUTPUT, **kw)
+
+    def nights(self, plan):
+        return {night(a) for a in plan}
+
+    def test_two_nights_two_folders_default(self):
+        ms = ([lm('n1', '2025-08-05T22:00:00') for _ in range(50)] +
+              [lm('n2', '2025-08-12T22:00:00') for _ in range(50)])
+        plan = self.run(ms)
+        assert self.nights(plan) == {'2025-08-05_15s', '2025-08-12_15s'}
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in plan)
+
+    def test_session_crossing_midnight_is_one_folder(self):
+        ms = [lm('n1', f'2025-08-05T{h:02d}:00:00', exp=60.0) for h in (22, 23)] + \
+             [lm('n1', f'2025-08-06T{h:02d}:00:00', exp=60.0) for h in (0, 1, 2)]
+        plan = self.run(ms)
+        assert self.nights(plan) == {'2025-08-05_60s'}
+
+    def test_post_midnight_start_labeled_previous_evening(self):
+        ms = [lm('n1', '2025-07-29T00:51:00') for _ in range(50)]
+        assert self.nights(self.run(ms)) == {'2025-07-28_15s'}
+
+    def test_exposure_in_label(self):
+        ms = [lm('n1', '2025-08-05T22:00:00', exp=7.5) for _ in range(100)]
+        assert self.nights(self.run(ms)) == {'2025-08-05_7.5s'}
+
+    def test_devices_get_separate_folders(self):
+        ms = ([lm('d3', '2025-08-05T22:00:00', device='DWARF_3') for _ in range(50)] +
+              [lm('ss', '2025-08-05T22:00:00', device='SEESTAR_S50', exp=10.0,
+                  name=f'Light_M 31_10.0s_LP_20250805-2200{i:02d}.fit') for i in range(50)])
+        plan = self.run(ms)
+        assert self.nights(plan) == {'2025-08-05_15s', '2025-08-05_10s'}
+
+    def test_seestar_sub_and_stack_share_night_folder(self):
+        subs = [lm('M 16_sub Seestar 50', '2025-08-07T02:38:00', device='SEESTAR_S50', exp=10.0,
+                   name=f'Light_M 16_10.0s_LP_20250806-2138{i:02d}.fit', target='M 16') for i in range(70)]
+        stack = lm('M 16 Seestar 50', '2025-08-07T02:00:00', device='SEESTAR_S50', exp=10.0,
+                   name='Stacked_70_M 16_10.0s_LP_20250806-233001.fit', target='M 16')
+        plan = self.run(subs + [stack])
+        lights = [a for a in plan if FOLDER_LIGHTS in a.dest.parts]
+        stk = [a for a in plan if FOLDER_DEVICE_STACK in a.dest.parts]
+        assert {night(a) for a in lights} == {night(a) for a in stk} == {'2025-08-06_10s'}
+        assert FOLDER_FINALS in stk[0].dest.parts
+
+    def test_stack_goes_to_finals_device_night(self):
+        ms = [lm('n1', '2025-08-05T22:00:00') for _ in range(50)]
+        ms.append(lm('n1', '2025-08-05T23:00:00', name='stacked-50_M31_LP.fits'))
+        plan = self.run(ms)
+        stk = [a for a in plan if a.source.name.startswith('stacked-')][0]
+        assert stk.dest.parent.parts[-3:] == (FOLDER_FINALS, FOLDER_DEVICE_STACK, '2025-08-05_15s')
+
+    def test_merge_nights_restores_old_layout(self):
+        ms = [lm('n1', '2025-08-05T22:00:00'), lm('n2', '2025-08-12T22:00:00')]
+        plan = self.run(ms, split_nights=False)
+        assert {a.dest.parent.name for a in plan} == {FOLDER_LIGHTS}
+        assert all(a.session == '' for a in plan)
+
+    def test_no_time_goes_to_unknown_date_folder(self):
+        ms = [lm('n1', None) for _ in range(50)]
+        assert self.nights(self.run(ms)) == {FOLDER_UNKNOWN_DATE}
+
+    def test_calibration_and_unknown_frames_unchanged(self):
+        d = lm('n1', '2025-08-05T22:00:00', ftype='DARK')
+        u = lm('n1', '2025-08-05T22:00:00', ftype='UNKNOWN')
+        plan = self.run([d, u])
+        assert plan[0].dest.parent.name == 'Dark' and plan[1].dest.parent.name == FOLDER_REVIEW
+
+
+class TestReviewSessions:
+    def run(self, metas, **kw):
+        return plan_migration(metas, OUTPUT, **kw)
+
+    def test_short_session_flagged(self):
+        ms = [lm('n7', '2025-10-12T20:46:00', exp=15.0) for _ in range(6)]     # 90 s
+        plan = self.run(ms)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+        assert all('min of exposure' in a.review_reason for a in plan)
+
+    def test_session_at_threshold_not_flagged(self):
+        ms = [lm('n1', '2025-10-12T20:46:00', exp=60.0) for _ in range(10)]    # exactly 10 min
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in self.run(ms))
+
+    def test_threshold_configurable(self):
+        ms = [lm('n1', '2025-10-12T20:46:00', exp=60.0) for _ in range(10)]
+        plan = self.run(ms, min_session_minutes=30)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+
+    def test_long_session_not_flagged(self):
+        ms = [lm('n1', '2025-10-12T20:46:00', exp=30.0) for _ in range(200)]
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in self.run(ms))
+
+    def test_unknown_target_flagged(self):
+        ms = [lm('u1', '2026-02-27T19:50:00', exp=30.0, target='Unknown(1)') for _ in range(100)]
+        plan = self.run(ms)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+        assert 'Unknown' in plan[0].review_reason
+
+    def test_failed_frames_flagged(self):
+        ms = [lm('f1', '2026-02-27T19:50:00', exp=30.0, target='Orion',
+                 name=f'failed_Orion_{i}.fits') for i in range(100)]
+        assert 'failed capture' in self.run(ms)[0].review_reason
+
+    def test_stack_of_flagged_session_also_goes_to_review(self):
+        ms = [lm('n7', '2025-10-12T20:46:00', exp=15.0) for _ in range(6)]
+        ms.append(lm('n7', '2025-10-12T20:50:00', name='stacked-6_M31.fits'))
+        plan = self.run(ms)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+
+    def test_stack_only_session_not_flagged_for_short_integration(self):
+        plan = self.run([lm('s', '2025-10-12T20:50:00', name='stacked-6_M31.fits')])
+        assert FOLDER_DEVICE_STACK in plan[0].dest.parts
+
+    def test_unknown_exposure_not_flagged_by_threshold(self):
+        ms = [lm('n1', '2025-10-12T20:46:00', exp=None) for _ in range(3)]
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in self.run(ms))
+
+    def test_summary_lists_flagged_sessions(self, capsys):
+        ms = [lm('n7', '2025-10-12T20:46:00', exp=15.0) for _ in range(6)]
+        print_summary(self.run(ms))
+        out = capsys.readouterr().out
+        assert 'flagged for review' in out and '_Review/2025-10-12_15s' in out
+
+
+class TestSessionWarnings:
+    def test_folder_date_mismatch_warns(self, caplog):
+        folder = 'DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-08-05-21-23-06-495'
+        ms = [lm(folder, '2025-07-25T00:34:00') for _ in range(50)]
+        import logging
+        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+            plan = plan_migration(ms, OUTPUT)
+        assert any('date mismatch' in r.message for r in caplog.records)
+        assert night(plan[0]) == '2025-07-24_15s'      # trusts capture times
+
+    def test_matching_folder_date_silent(self, caplog):
+        folder = 'DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-07-29-00-50-58-376'
+        ms = [lm(folder, '2025-07-29T00:51:00') for _ in range(50)]
+        import logging
+        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+            plan_migration(ms, OUTPUT)
+        assert not [r for r in caplog.records if 'mismatch' in r.message]
+
+    def test_seestar_time_conflict_warns_once(self, caplog):
+        ms = [lm('s', '2025-08-06T21:39:20', device='SEESTAR_S50', exp=10.0,
+                 name=f'Light_M 16_10.0s_LP_20250806-2139{i:02d}.fit') for i in range(20)]
+        import logging
+        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+            plan_migration(ms, OUTPUT)
+        msgs = [r for r in caplog.records if 'does not match' in r.message]
+        assert len(msgs) == 1 and '20 Seestar' in msgs[0].message
+
+
+class TestNightSplitExecute:
+    def test_execute_creates_night_folders_and_placeholders(self, tmp_path):
+        src = tmp_path / 'src' / 'night1'
+        src.mkdir(parents=True)
+        ms = []
+        for i in range(30):
+            f = src / f'frame_{i:03d}.fits'
+            f.write_bytes(b'FITS')
+            ms.append(make_meta(file_path=str(f), file_name=f.name, device_type='DWARF_3',
+                                object_name='M 31', observation_date='2025-08-05T22:00:00',
+                                exposure_time=30.0, observation_year=2025))
+        st = src / 'stacked-30_M31.fits'
+        st.write_bytes(b'FITS')
+        ms.append(make_meta(file_path=str(st), file_name=st.name, device_type='DWARF_3',
+                            object_name='M 31', observation_date='2025-08-05T23:00:00',
+                            exposure_time=30.0, observation_year=2025))
+        out = tmp_path / 'out'
+        plan = plan_migration(ms, out)
+        stats = execute_plan(plan, dry_run=False, output_root=out)
+        assert stats['errors'] == 0
+        base = out / '2025' / 'M 31'
+        assert (base / 'Lights' / '2025-08-05_30s' / 'frame_000.fits').exists()
+        assert (base / 'Finals' / 'Device' / '2025-08-05_30s' / 'stacked-30_M31.fits').exists()
+        assert (base / 'Finals' / 'PixInsight').is_dir()      # placeholders at Finals/ level
+        assert (base / 'Finals' / 'Siril').is_dir()
+        assert not (base / 'Finals' / 'Device' / '2025-08-05_30s' / 'PixInsight').exists()

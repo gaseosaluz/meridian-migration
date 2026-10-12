@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 2 - Rev 2
+Sprint 2, Phase 2 - Rev 3: per-night sessions
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
 files into the structure expected by Meridian (MacObservatory.com):
@@ -28,6 +28,22 @@ files into the structure expected by Meridian (MacObservatory.com):
           Flat/
         _Review/                   ← UNKNOWN frame type — needs manual review
 
+REV 3 - NIGHT SPLITTING (default):
+    Lights, device stacks and review frames are grouped into capture SESSIONS
+    (one source capture folder = one night; a Seestar 'X_sub' folder is treated
+    as part of folder 'X').  Each session gets a folder named for the EVENING
+    the session started, in local time, plus the exposure:
+
+        Year/Target/Lights/2025-08-06_10s/
+        Year/Target/Finals/Device/2025-08-06_10s/
+        Year/Target/_Review/2025-08-06_10s/      (aborted / Unknown / failed)
+
+    Evening convention: a session starting before 12:00 local belongs to the
+    previous evening's date.  Seestar times come from the local time embedded
+    in the filename; if absent, the UTC header time is converted with --tz.
+    DWARF header times are already local.  Use --merge-nights for the old
+    single-folder behavior.
+
 USAGE:
     # Dry-run (default — no files touched, shows what WOULD happen)
     python fits_migrator.py SOURCE_ROOT OUTPUT_ROOT --summary
@@ -47,6 +63,9 @@ import re
 import sys
 import shutil
 import logging
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -72,6 +91,14 @@ FOLDER_SIRIL        = 'Siril'        # inside Finals/ — populated manually by 
 FOLDER_SHARED_CALIB = '_Calibration' # factory/shared frames with no target
 FOLDER_REVIEW       = '_Review'      # UNKNOWN frame type — needs human attention
 FOLDER_UNKNOWN_YEAR = '_UnknownYear' # files with no parseable date
+FOLDER_UNKNOWN_DATE = '_UnknownDate' # session with no usable capture time
+
+# Rev 3 — night splitting
+DEFAULT_TZ                  = 'America/Chicago'
+DEFAULT_MIN_SESSION_MINUTES = 10.0
+# Max allowed gap between a Seestar's filename (local) time and its header (UTC)
+# time converted to the configured timezone before we warn about a mismatch.
+_SEESTAR_TIME_TOLERANCE = timedelta(minutes=30)
 
 # Filesystem characters that are unsafe across macOS / Linux / Windows
 _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
@@ -99,6 +126,8 @@ class MigrationAction:
     frame_type:  str = ''
     target:      str = ''
     year:        str = ''
+    session:       str = ''   # Rev 3: night folder label, e.g. '2025-08-06_10s'
+    review_reason: str = ''   # Rev 3: non-empty when the whole session is flagged
 
     @property
     def is_skip(self) -> bool:
@@ -149,7 +178,167 @@ def _is_device_stack(filename: str) -> bool:
     return lower.startswith('stacked-') or lower.startswith('stacked_')
 
 
-def build_dest_path(meta: FITSMetadata, output_root: Path) -> Path:
+# ──────────────────────────────────────────────────────────────────────────────
+# Night / session helpers  (Rev 3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_FILENAME_TS     = re.compile(r'(?<!\d)(\d{8})-(\d{6})(\d{3})?(?!\d)')
+_FOLDER_DATE     = re.compile(r'(20\d{2})-(\d{2})-(\d{2})-\d{2}-\d{2}-\d{2}')
+_SUB_TOKEN       = re.compile(r'_sub\b', re.IGNORECASE)
+
+
+@dataclass
+class SessionInfo:
+    """One capture session (one night, one scope, one target)."""
+    label:         str            # '2025-08-06_10s'
+    review:        bool = False
+    review_reason: str  = ''
+    frames:        int  = 0       # regular light sub-frames
+    integration_s: float = 0.0
+
+
+def parse_filename_time(filename: str) -> Optional[datetime]:
+    """Local capture time embedded in a filename like ..._20250806-213920[123]_..."""
+    m = _FILENAME_TS.search(filename)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
+    except ValueError:
+        return None
+
+
+def _header_time(meta: FITSMetadata) -> Optional[datetime]:
+    s = meta.observation_date
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).strip().rstrip('Z').replace(' ', 'T'))
+    except ValueError:
+        return None
+
+
+def _is_seestar(meta: FITSMetadata) -> bool:
+    return (meta.device_type or '').upper().startswith('SEESTAR')
+
+
+def local_capture_time(meta: FITSMetadata, tz_name: str = DEFAULT_TZ):
+    """
+    Return (local_datetime_or_None, header_conflict: bool), naive local time.
+
+    Seestar : filename time is local -> primary.  Fallback: header is UTC,
+              converted to tz_name.  header_conflict is True when both exist
+              and disagree by more than 30 minutes (firmware / region change).
+    Others  : header time is already local (verified for DWARF 3 / Mini);
+              fallback to a time embedded in the filename.
+    """
+    fn_time  = parse_filename_time(meta.file_name)
+    hdr_time = _header_time(meta)
+
+    if _is_seestar(meta):
+        converted = None
+        if hdr_time is not None:
+            converted = (hdr_time.replace(tzinfo=timezone.utc)
+                         .astimezone(ZoneInfo(tz_name)).replace(tzinfo=None))
+        if fn_time is not None:
+            conflict = (converted is not None and not _is_device_stack(meta.file_name)
+                        and abs(converted - fn_time) > _SEESTAR_TIME_TOLERANCE)
+            return fn_time, conflict
+        return converted, False
+
+    return (hdr_time if hdr_time is not None else fn_time), False
+
+
+def night_label(local_dt: datetime) -> str:
+    """Evening convention: a capture starting before 12:00 belongs to the previous day."""
+    return (local_dt - timedelta(hours=12)).strftime('%Y-%m-%d')
+
+
+def normalize_session_folder(name: str) -> str:
+    """'M 16_sub Seestar 50' -> 'M 16 Seestar 50' (Seestar sub-frame folder)."""
+    return re.sub(r'\s+', ' ', _SUB_TOKEN.sub('', name)).strip()
+
+
+def session_key(meta: FITSMetadata) -> tuple:
+    p = Path(meta.file_path)
+    target = sanitize_name(meta.object_name) if meta.object_name.strip() else '_NoTarget'
+    return (_year_folder(meta), target, meta.device_type,
+            str(p.parent.parent / normalize_session_folder(p.parent.name)))
+
+
+def _exposure_label(exposures: list) -> str:
+    known = [e for e in exposures if e]
+    if not known:
+        return ''
+    return f"_{Counter(known).most_common(1)[0][0]:g}s"
+
+
+def build_sessions(metas: list,
+                   tz_name: str = DEFAULT_TZ,
+                   min_session_minutes: float = DEFAULT_MIN_SESSION_MINUTES) -> dict:
+    """
+    Group LIGHT frames (regular lights and device stacks) into sessions.
+    Returns {session_key: SessionInfo}.
+    """
+    groups: dict = {}
+    for m in metas:
+        if m.frame_type == 'LIGHT':
+            groups.setdefault(session_key(m), []).append(m)
+
+    sessions: dict = {}
+    conflicts: list = []
+    for key, members in groups.items():
+        target = key[1]
+        subs   = [m for m in members if not _is_device_stack(m.file_name)]
+        basis  = subs if subs else members
+
+        times = []
+        for m in basis:
+            t, conflict = local_capture_time(m, tz_name)
+            if t is not None:
+                times.append(t)
+            if conflict:
+                conflicts.append(m.file_name)
+
+        info = SessionInfo(label=FOLDER_UNKNOWN_DATE, frames=len(subs))
+        if times:
+            first = min(times)
+            info.label = night_label(first) + _exposure_label([m.exposure_time for m in basis])
+            fm = _FOLDER_DATE.search(Path(key[3]).name)
+            if fm:
+                folder_dt = datetime(int(fm.group(1)), int(fm.group(2)), int(fm.group(3)))
+                if abs((first - folder_dt).days) > 1:
+                    logger.warning(
+                        f"Session date mismatch for {target}: capture times say "
+                        f"{first:%Y-%m-%d} but folder name says {folder_dt:%Y-%m-%d} "
+                        f"({Path(key[3]).name}) — using capture times")
+
+        exps = [m.exposure_time for m in subs if m.exposure_time is not None]
+        info.integration_s = float(sum(exps))
+
+        reasons = []
+        if re.match(r'unknown', target, re.IGNORECASE):
+            reasons.append('target is Unknown')
+        if subs and all(m.file_name.lower().startswith('failed_') for m in subs):
+            reasons.append('failed capture')
+        if exps and info.integration_s < min_session_minutes * 60:
+            reasons.append(f'only {info.integration_s / 60:.1f} min of exposure '
+                           f'(< {min_session_minutes:g} min)')
+        if reasons:
+            info.review, info.review_reason = True, '; '.join(reasons)
+        sessions[key] = info
+
+    if conflicts:
+        logger.warning(
+            f"{len(conflicts)} Seestar file(s) have a header time that does not match "
+            f"the time in the filename after converting from UTC to {tz_name} "
+            f"(e.g. {conflicts[0]}). Using filename time — firmware or region "
+            f"settings may have changed; please check.")
+    return sessions
+
+
+def build_dest_path(meta: FITSMetadata, output_root: Path,
+                    session: Optional[SessionInfo] = None) -> Path:
     """
     Determine the destination directory for a single file.
 
@@ -161,6 +350,10 @@ def build_dest_path(meta: FITSMetadata, output_root: Path) -> Path:
       UNKNOWN               → Year/Target/_Review/
                             → Year/_Review/                   (no target)
 
+    Rev 3: when `session` is given, lights / stacks go into a per-night folder
+    (Lights/<label>/, Finals/Device/<label>/) or, for flagged sessions,
+    _Review/<label>/.  With session=None the Rev 2 layout is used unchanged.
+
     Returns the full destination path including filename.
     """
     year    = _year_folder(meta)
@@ -169,13 +362,20 @@ def build_dest_path(meta: FITSMetadata, output_root: Path) -> Path:
     fname   = meta.file_name
     ft_cap  = ft.title()            # 'Dark' | 'Bias' | 'Flat'
 
-    if ft == 'LIGHT':
+    if ft == 'LIGHT' and session is not None and session.review:
+        folder = (output_root / year / (target or '_NoTarget')
+                  / FOLDER_REVIEW / session.label)
+    elif ft == 'LIGHT':
         if _is_device_stack(fname):
             folder = (output_root / year / (target or '_NoTarget')
                       / FOLDER_FINALS / FOLDER_DEVICE_STACK)
+            if session is not None:
+                folder = folder / session.label
         else:
             folder = (output_root / year / (target or '_Review')
                       / FOLDER_LIGHTS)
+            if session is not None:
+                folder = folder / session.label
     elif ft in ('DARK', 'BIAS', 'FLAT'):
         if target:
             folder = (output_root / year / target
@@ -220,7 +420,10 @@ def plan_migration(results:     list,
                    output_root: Path,
                    operation:   str  = 'copy',
                    year_filter: Optional[str]  = None,
-                   device_filter: Optional[str] = None) -> list:
+                   device_filter: Optional[str] = None,
+                   split_nights: bool  = True,
+                   min_session_minutes: float = DEFAULT_MIN_SESSION_MINUTES,
+                   tz_name: str = DEFAULT_TZ) -> list:
     """
     Build a migration plan from a list of FITSMetadata objects.
 
@@ -233,8 +436,12 @@ def plan_migration(results:     list,
         operation:     'copy' or 'move'
         year_filter:   If set, only include files from this year (e.g. '2025')
         device_filter: If set, only include files from this device
+        split_nights:  Rev 3 — one folder per capture night (default True).
+                       False restores the Rev 2 merged layout.
+        min_session_minutes: sessions with less total exposure go to _Review
+        tz_name:       timezone used to convert Seestar UTC header times
     """
-    plan: list = []
+    entries: list = []      # ('skip', MigrationAction) | ('go', FITSMetadata)
 
     for meta in results:
         source = Path(meta.file_path)
@@ -247,21 +454,38 @@ def plan_migration(results:     list,
 
         # ── Skip unreadable files ─────────────────────────────────────────────
         if not meta.is_valid:
-            plan.append(MigrationAction(
+            entries.append(('skip', MigrationAction(
                 source=source, dest=Path('/dev/null'),
                 operation='skip', skip_reason='File could not be read by FITS extractor',
                 device=meta.device_type, frame_type=meta.frame_type,
                 target=meta.object_name, year=_year_folder(meta),
-            ))
+            )))
             continue
 
-        dest = build_dest_path(meta, output_root)
+        entries.append(('go', meta))
+
+    sessions: dict = {}
+    if split_nights:
+        sessions = build_sessions([x for kind, x in entries if kind == 'go'],
+                                  tz_name=tz_name,
+                                  min_session_minutes=min_session_minutes)
+
+    plan: list = []
+    for kind, item in entries:
+        if kind == 'skip':
+            plan.append(item)
+            continue
+        meta = item
+        session = sessions.get(session_key(meta)) if meta.frame_type == 'LIGHT' else None
+        dest = build_dest_path(meta, output_root, session)
 
         plan.append(MigrationAction(
-            source=source, dest=dest,
+            source=Path(meta.file_path), dest=dest,
             operation=operation, skip_reason='',
             device=meta.device_type, frame_type=meta.frame_type,
             target=meta.object_name, year=_year_folder(meta),
+            session=session.label if session else '',
+            review_reason=session.review_reason if session else '',
         ))
 
     return plan
@@ -344,6 +568,21 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
     print(f"  Targets       : {len(targets)} unique")
     for t in sorted(targets):
         print(f"    • {t}")
+
+    # Rev 3 — night sessions and review flags
+    night_sessions: dict = {}
+    for a in plan:
+        if not a.is_skip and a.session:
+            k = (a.year, a.target, a.device, a.session, a.review_reason)
+            night_sessions[k] = night_sessions.get(k, 0) + 1
+    if night_sessions:
+        flagged = {k: n for k, n in night_sessions.items() if k[4]}
+        print(f"  {'─' * (W - 2)}")
+        print(f"  Night sessions: {len(night_sessions)}  "
+              f"({len(flagged)} flagged for review)")
+        for (year, target, device, label, reason), n in sorted(flagged.items()):
+            print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
+                  f"{n} file(s) — {reason}")
     print('=' * W)
 
 
@@ -414,9 +653,13 @@ def _create_pi_placeholders(plan: list, output_root: Path) -> None:
     """
     finals_dirs: set = set()
     for action in plan:
-        if not action.is_skip and FOLDER_DEVICE_STACK in str(action.dest):
-            # action.dest is …/Finals/Device/filename — parent.parent = …/Finals/
-            finals_dirs.add(action.dest.parent.parent)
+        if action.is_skip:
+            continue
+        parts = action.dest.parts
+        if FOLDER_FINALS in parts and FOLDER_DEVICE_STACK in parts:
+            # …/Finals/Device/[night/]filename  ->  …/Finals/
+            idx = parts.index(FOLDER_FINALS)
+            finals_dirs.add(Path(*parts[:idx + 1]))
     for finals_dir in finals_dirs:
         for subfolder in (FOLDER_PI_WORK, FOLDER_SIRIL):
             placeholder = finals_dir / subfolder
@@ -460,11 +703,25 @@ Examples:
                         help='Move files instead of copying (requires --execute)')
     parser.add_argument('--year',      help='Only migrate files from this year, e.g. 2025')
     parser.add_argument('--device',    help='Only migrate files from this device, e.g. SEESTAR_S50')
+    parser.add_argument('--merge-nights', action='store_true',
+                        help='Put all nights of a target in one folder (old behavior)')
+    parser.add_argument('--min-session-minutes', type=float,
+                        default=DEFAULT_MIN_SESSION_MINUTES,
+                        help='Sessions with less total exposure go to _Review '
+                             f'(default {DEFAULT_MIN_SESSION_MINUTES:g})')
+    parser.add_argument('--tz', default=DEFAULT_TZ,
+                        help='Timezone for converting Seestar UTC header times '
+                             f'(default {DEFAULT_TZ})')
     parser.add_argument('--summary',   action='store_true',
                         help='Show summary statistics only (no per-directory listing)')
     parser.add_argument('--verbose',   action='store_true',
                         help='Show every individual file operation')
     args = parser.parse_args()
+
+    try:
+        ZoneInfo(args.tz)
+    except Exception:
+        parser.error(f"unknown timezone '{args.tz}' (example: America/Chicago)")
 
     source_root = Path(args.source).expanduser()
     output_root = Path(args.output).expanduser()
@@ -480,6 +737,7 @@ Examples:
     print(f"  Output    : {output_root}")
     if args.year:   print(f"  Year      : {args.year}")
     if args.device: print(f"  Device    : {args.device}")
+    print(f"  Nights    : {'MERGED (old layout)' if args.merge_nights else 'SPLIT per night, tz ' + args.tz}")
 
     # ── Scan ──────────────────────────────────────────────────────────────────
     print(f"\n  Scanning {source_root} …")
@@ -491,6 +749,9 @@ Examples:
         operation=operation,
         year_filter=args.year,
         device_filter=args.device,
+        split_nights=not args.merge_nights,
+        min_session_minutes=args.min_session_minutes,
+        tz_name=args.tz,
     )
 
     # ── Report ────────────────────────────────────────────────────────────────

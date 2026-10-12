@@ -603,6 +603,9 @@ class TestKnownHeaderFiltering:
         for kw in ('NEWKEY', 'FUTRSCOP', 'MYSTERY1', 'ZZZZZZ'):
             assert not _is_known_header(kw), f"'{kw}' should be unknown"
 
+    def test_rev5_widecam_known(self):
+        assert _is_known_header('WIDECAM') and _is_known_header('widecam')
+
     def test_case_insensitive_matching(self):
         """Header names should match regardless of case."""
         assert _is_known_header('telescop')
