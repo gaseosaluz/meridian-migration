@@ -756,3 +756,113 @@ class TestConfiguration:
     def test_stacked_underscore_maps_to_light(self):
         """Rev 4: stacked_ (Seestar) must also map to LIGHT."""
         assert FRAME_FILENAME_PREFIXES['stacked_'] == 'LIGHT'
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 6 — Seestar S30 Pro, implausible-date guard
+# ══════════════════════════════════════════════════════════════════════════════
+import logging as _logging
+from datetime import datetime
+from fits_metadata_extractor import is_plausible_year, extract_metadata, detect_device as _detect_device
+
+
+class TestS30Pro:
+    def hdr(self, **kw):
+        base = {'TELESCOP': 'S30 Pro_da267bef', 'CREATOR': 'ZWO Seestar S30 Pro',
+                'NAXIS1': 2160, 'NAXIS2': 3840}
+        base.update(kw)
+        return make_header(base)
+
+    def test_detected_by_telescop_serial_prefix(self):
+        h = self.hdr(CREATOR='something else')
+        assert _detect_device(h)[0] == 'SEESTAR_S30_PRO'
+
+    def test_detected_by_creator(self):
+        h = self.hdr(TELESCOP='whatever')
+        assert _detect_device(h) == ('SEESTAR_S30_PRO', [], 'header')
+
+    def test_detected_by_dimensions_with_warning(self):
+        h = make_header({'TELESCOP': 'new name', 'NAXIS1': 2160, 'NAXIS2': 3840})
+        device, warnings, source = _detect_device(h)
+        assert device == 'SEESTAR_S30_PRO' and source == 'dimensions' and warnings
+
+    def test_detected_by_path(self):
+        h = make_header({})
+        device, _, source = _detect_device(h, Path('/data/2026/Seestar S30 Pro/x.fit'))
+        assert device == 'SEESTAR_S30_PRO' and source == 'path'
+
+    def test_s50_not_confused_with_s30_pro(self):
+        h = make_header({'TELESCOP': 'S50_40d24ed8', 'CREATOR': 'ZWO Seestar S50'})
+        assert _detect_device(h)[0] == 'SEESTAR_S50'
+
+    def test_new_headers_are_known(self):
+        assert _is_known_header('BIAS') and _is_known_header('DATE-EXP')
+
+
+class TestImplausibleDates:
+    @pytest.mark.parametrize('year,ok', [(2014, False), (2015, True), (2025, True),
+                                         (datetime.now().year + 1, True),
+                                         (datetime.now().year + 2, False), (2038, False)])
+    def test_plausible_year(self, year, ok):
+        assert is_plausible_year(year) is ok
+
+    def test_2038_ignored_and_recorded(self):
+        from fits_metadata_extractor import _implausible_dates
+        _implausible_dates.clear()
+        h = make_header({'DATE-OBS': '2038-01-01T00:07:00.901'})
+        assert parse_observation_date(h) == (None, None, None)
+        assert _implausible_dates == ['2038-01-01T00:07:00.901']
+
+    def test_scan_reports_implausible_dates_with_one_warning(self, tmp_path, caplog):
+        import numpy as np
+        from fits_metadata_extractor import scan_directory
+        d = tmp_path / '2026' / 'DWARF mini'
+        d.mkdir(parents=True)
+        for i in range(4):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF mini'; h['DATE-OBS'] = f'2038-01-01T00:07:0{i}'
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(d / f'dark_exp_10_gain_60_bin_1_33C_stack_{i}.fits')
+        with caplog.at_level(_logging.WARNING, logger='fits_extractor'):
+            scan_directory(tmp_path)
+        msgs = [r.message for r in caplog.records if 'implausible' in r.message.lower()]
+        assert len(msgs) == 1 and msgs[0].startswith('4 file(s)')
+
+    def test_normal_date_unchanged(self):
+        h = make_header({'DATE-OBS': '2026-03-24T20:37:32'})
+        assert parse_observation_date(h) == ('2026-03-24T20:37:32', 2026, 3)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 8 — truncated files
+# ══════════════════════════════════════════════════════════════════════════════
+class TestTruncatedFiles:
+    def write(self, tmp_path, name='light_M 31_1.fits', keep=None):
+        import numpy as np
+        h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 31'; h['EXPTIME'] = 15.0
+        p = tmp_path / name
+        fits.PrimaryHDU(np.zeros((200, 300), dtype='uint16'), header=h).writeto(p)
+        if keep is not None:
+            p.write_bytes(p.read_bytes()[:keep])
+        return p
+
+    def test_intact_file_not_truncated(self, tmp_path):
+        meta = extract_metadata(self.write(tmp_path))
+        assert meta.is_valid and meta.truncated is False
+
+    def test_cut_file_is_truncated_but_still_readable(self, tmp_path):
+        p = self.write(tmp_path)
+        meta = extract_metadata(self.write(tmp_path, 'light_M 31_2.fits', keep=p.stat().st_size // 2))
+        assert meta.is_valid and meta.truncated is True and meta.object_name == 'M 31'
+        assert any('truncated' in w for w in meta.warnings)
+
+    def test_scan_reports_truncated_files_once(self, tmp_path, caplog):
+        from fits_metadata_extractor import scan_directory
+        full = self.write(tmp_path).stat().st_size
+        for i in range(3):
+            self.write(tmp_path, f'light_M 31_cut{i}.fits', keep=full // 2)
+        with caplog.at_level(_logging.WARNING, logger='fits_extractor'):
+            results = scan_directory(tmp_path)
+        msgs = [r.message for r in caplog.records if 'truncated file(s) found' in r.message]
+        assert len(msgs) == 1 and msgs[0].startswith('3 truncated')
+        assert sum(r.truncated for r in results) == 3

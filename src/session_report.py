@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fits_migrator import sanitize_name, _year_folder
+from fits_migrator import sanitize_name, _year_folder, version_banner
 
 NEAR = timedelta(hours=12)
 
@@ -78,6 +78,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('source')
     ap.add_argument('--target', help='Only this target, e.g. "M 31"')
+    ap.add_argument('--version', action='version', version=version_banner())
     args = ap.parse_args()
 
     from fits_metadata_extractor import scan_directory
@@ -85,7 +86,7 @@ def main():
     grouped = group_sessions(results, args.target)
 
     print('\n' + '=' * 78)
-    print('  SESSION PREVIEW (read-only)')
+    print(f'  SESSION PREVIEW (read-only)   {version_banner()}')
     print('=' * 78)
     for (year, target, device), sessions in sorted(grouped.items()):
         multi = '  <-- multi-session' if len(sessions) > 1 else ''

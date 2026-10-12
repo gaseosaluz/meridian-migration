@@ -6,6 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
+Version 0.8.0 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -84,9 +85,19 @@ from typing import Optional
 # Phase 1 extractor — must be in the same directory (or on PYTHONPATH)
 from fits_metadata_extractor import (
     FITSMetadata,
+    is_plausible_year,
+    environment_line,
+    logger as extractor_logger,
     scan_directory,
     setup_logging,
 )
+
+# One shared project version (must equal the extractor's; see RELEASING.md)
+__version__ = "0.8.0"
+try:
+    from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
+except ImportError:                                  # extractor older than 0.8.0
+    EXTRACTOR_VERSION = "unknown (older than 0.8.0)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -118,7 +129,52 @@ _UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
-logger = setup_logging(log_file='migration.log')
+# The migrator logs to its own logger: console now, and a log file attached per
+# run by attach_run_log() (migration.log for a dry run, migration_<time>.log for
+# --execute).  Scan 'surprises' stay in surprises.log (the extractor's logger).
+logger = setup_logging(log_file=None, name='fits_migrator')
+
+
+def version_banner() -> str:
+    return f"fits_migrator {__version__} (extractor {EXTRACTOR_VERSION})"
+
+
+def version_mismatch() -> Optional[str]:
+    """Warning text if the migrator and extractor are different versions."""
+    if EXTRACTOR_VERSION != __version__:
+        return (f"Version mismatch: fits_migrator is {__version__} but "
+                f"fits_metadata_extractor is {EXTRACTOR_VERSION}. Download all "
+                f"files from the same release.")
+    return None
+
+
+def attach_run_log(dry_run: bool, directory: Path = Path('.'),
+                   now: Optional[datetime] = None) -> Path:
+    """
+    Attach this run's log file to the migrator logger and write a header
+    (version, environment, command line) to it and to surprises.log.
+
+    dry-run  -> migration.log               (overwritten each time)
+    execute  -> migration_YYYYmmdd_HHMMSS.log  (kept: a record of what was copied)
+    """
+    now = now or datetime.now()
+    name = 'migration.log' if dry_run else f"migration_{now:%Y%m%d_%H%M%S}.log"
+    path = Path(directory) / name
+    fmt = logging.Formatter('%(asctime)s [%(levelname)-8s] %(message)s',
+                            datefmt='%Y-%m-%d %H:%M:%S')
+    fh = logging.FileHandler(path, mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    fh.set_name('run-log')
+    for h in [h for h in logger.handlers if h.get_name() == 'run-log']:
+        logger.removeHandler(h)                     # replace a previous run's handler
+        h.close()
+    logger.addHandler(fh)
+    header = (f"{version_banner()}; {environment_line()}; "
+              f"mode={'dry-run' if dry_run else 'execute'}; args={' '.join(sys.argv[1:])}")
+    logger.debug(header)
+    extractor_logger.debug(header)
+    return path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -178,6 +234,25 @@ def _year_folder(meta: FITSMetadata) -> str:
     return FOLDER_UNKNOWN_YEAR
 
 
+def _is_failed_frame(meta: FITSMetadata) -> bool:
+    """A sub-frame the device itself marked as failed (file name 'failed_...')."""
+    return (meta.frame_type == 'LIGHT'
+            and not _is_device_stack(meta.file_name)
+            and meta.file_name.lower().startswith('failed_'))
+
+
+def _frame_problem(meta: FITSMetadata) -> str:
+    """Reason a single frame goes to _Review ('' if it is fine)."""
+    if _is_failed_frame(meta):
+        return 'failed frame'
+    if getattr(meta, 'truncated', False):
+        return 'truncated file'
+    return ''
+
+
+_PER_FRAME_REASONS = ('failed frame', 'truncated file')
+
+
 def _is_device_stack(filename: str) -> bool:
     """True for device-produced stacked frames.
 
@@ -224,9 +299,10 @@ def _header_time(meta: FITSMetadata) -> Optional[datetime]:
     if not s:
         return None
     try:
-        return datetime.fromisoformat(str(s).strip().rstrip('Z').replace(' ', 'T'))
+        dt = datetime.fromisoformat(str(s).strip().rstrip('Z').replace(' ', 'T'))
     except ValueError:
         return None
+    return dt if is_plausible_year(dt.year) else None
 
 
 def _is_seestar(meta: FITSMetadata) -> bool:
@@ -273,15 +349,28 @@ def normalize_session_folder(name: str) -> str:
 def session_key(meta: FITSMetadata) -> tuple:
     p = Path(meta.file_path)
     target = sanitize_name(meta.object_name) if meta.object_name.strip() else '_NoTarget'
-    return (_year_folder(meta), target, meta.device_type,
+    return (target, meta.device_type,
             str(p.parent.parent / normalize_session_folder(p.parent.name)))
+
+
+_SOLAR_SYSTEM = frozenset({'moon', 'sun', 'mercury', 'venus', 'mars', 'jupiter',
+                            'saturn', 'uranus', 'neptune', 'pluto'})
+
+
+def is_solar_system_target(name: str) -> bool:
+    """Moon / Sun / planets / comets: short exposures are normal, not 'aborted'."""
+    n = name.strip().lower()
+    return n in _SOLAR_SYSTEM or n.startswith('comet')
 
 
 def _exposure_label(exposures: list) -> str:
     known = [e for e in exposures if e]
     if not known:
         return ''
-    return f"_{Counter(known).most_common(1)[0][0]:g}s"
+    e = Counter(known).most_common(1)[0][0]
+    if e < 1:
+        return f"_{e * 1000:g}ms"
+    return f"_{e:g}s"
 
 
 def build_sessions(metas: list,
@@ -299,7 +388,7 @@ def build_sessions(metas: list,
     sessions: dict = {}
     conflicts: list = []
     for key, members in groups.items():
-        target = key[1]
+        target = key[0]
         subs   = [m for m in members if not _is_device_stack(m.file_name)]
         basis  = subs if subs else members
 
@@ -311,28 +400,32 @@ def build_sessions(metas: list,
             if conflict:
                 conflicts.append(m.file_name)
 
-        info = SessionInfo(label=FOLDER_UNKNOWN_DATE, frames=len(subs))
+        good = [m for m in subs if not _frame_problem(m)]
+        info = SessionInfo(label=FOLDER_UNKNOWN_DATE, frames=len(good))
         if times:
             first = min(times)
-            info.label = night_label(first) + _exposure_label([m.exposure_time for m in basis])
-            fm = _FOLDER_DATE.search(Path(key[3]).name)
+            info.label = night_label(first) + _exposure_label(
+                [m.exposure_time for m in (good or basis)])
+            fm = _FOLDER_DATE.search(Path(key[2]).name)
             if fm:
                 folder_dt = datetime(int(fm.group(1)), int(fm.group(2)), int(fm.group(3)))
                 if abs((first - folder_dt).days) > 1:
                     logger.warning(
                         f"Session date mismatch for {target}: capture times say "
                         f"{first:%Y-%m-%d} but folder name says {folder_dt:%Y-%m-%d} "
-                        f"({Path(key[3]).name}) — using capture times")
+                        f"({Path(key[2]).name}) — using capture times")
 
-        exps = [m.exposure_time for m in subs if m.exposure_time is not None]
+        exps = [m.exposure_time for m in good if m.exposure_time is not None]
         info.integration_s = float(sum(exps))
 
         reasons = []
         if re.match(r'unknown', target, re.IGNORECASE):
             reasons.append('target is Unknown')
-        if subs and all(m.file_name.lower().startswith('failed_') for m in subs):
-            reasons.append('failed capture')
-        if exps and info.integration_s < min_session_minutes * 60:
+        if subs and not good:
+            reasons.append('failed capture' if all(_is_failed_frame(m) for m in subs)
+                           else 'no usable frames (failed or truncated)')
+        if (exps and not is_solar_system_target(target)
+                and info.integration_s < min_session_minutes * 60):
             reasons.append(f'only {info.integration_s / 60:.1f} min of exposure '
                            f'(< {min_session_minutes:g} min)')
         if reasons:
@@ -346,6 +439,16 @@ def build_sessions(metas: list,
             f"(e.g. {conflicts[0]}). Using filename time — firmware or region "
             f"settings may have changed; please check.")
     return sessions
+
+
+def _session_year(meta: FITSMetadata, session: Optional['SessionInfo']) -> str:
+    """Year folder follows the session's evening date (a New Year's Eve session
+    that runs past midnight stays together in the old year)."""
+    if session is not None:
+        m = re.match(r'(\d{4})-\d{2}-\d{2}', session.label)
+        if m:
+            return m.group(1)
+    return _year_folder(meta)
 
 
 def build_dest_path(meta: FITSMetadata, output_root: Path,
@@ -367,15 +470,23 @@ def build_dest_path(meta: FITSMetadata, output_root: Path,
 
     Returns the full destination path including filename.
     """
-    year    = _year_folder(meta)
+    year    = (_session_year(meta, session) if meta.frame_type == 'LIGHT'
+               else _year_folder(meta))
     target  = sanitize_name(meta.object_name) if meta.object_name.strip() else None
     ft      = meta.frame_type       # LIGHT | DARK | BIAS | FLAT | UNKNOWN
     fname   = meta.file_name
     ft_cap  = ft.title()            # 'Dark' | 'Bias' | 'Flat'
 
-    if ft == 'LIGHT' and session is not None and session.review:
+    problem = _frame_problem(meta)
+
+    if ft == 'LIGHT' and session is not None and (session.review or problem):
         folder = (output_root / year / (target or '_NoTarget')
                   / FOLDER_REVIEW / session.label)
+    elif problem and ft == 'LIGHT':                 # merged layout: no night folders
+        folder = output_root / year / (target or '_NoTarget') / FOLDER_REVIEW
+    elif problem:                                   # damaged calibration frame
+        folder = (output_root / year / target / FOLDER_REVIEW
+                  if target else output_root / year / FOLDER_REVIEW)
     elif ft == 'LIGHT':
         if _is_device_stack(fname):
             folder = (output_root / year / (target or '_NoTarget')
@@ -423,6 +534,30 @@ def _make_unique_dest(dest: Path) -> Path:
         counter += 1
 
 
+def _resolve_dest(source: Path, dest: Path, claimed: set, match_existing: bool = True):
+    """
+    Choose the destination for `source`.  Returns (path, already_present).
+
+    Tries dest, dest_2, dest_3 ... in order and skips any path another file has
+    already claimed in THIS run.  A candidate that exists and is a copy of
+    `source` (same size and time) means 'already present' (re-runs are safe);
+    a different file with the same name is never overwritten or mistaken for
+    a copy.  Different sources that share a name (e.g. DWARF calibration files
+    such as bias_gain_2_bin_1.fits from several sessions) each get their own file.
+    """
+    candidate, n = dest, 1
+    while True:
+        if candidate not in claimed:
+            if not candidate.exists():
+                claimed.add(candidate)
+                return candidate, False
+            if match_existing and _same_file(source, candidate):
+                claimed.add(candidate)
+                return candidate, True
+        n += 1
+        candidate = dest.with_name(f"{dest.stem}_{n}{dest.suffix}")
+
+
 def _same_file(source: Path, dest: Path) -> bool:
     """True when dest already holds a copy of source (same size, same mtime +-2 s)."""
     try:
@@ -439,10 +574,12 @@ def check_free_space(plan: list, output_root: Path, margin: float = 0.02):
     counted; 'move' operations need no extra space (assumes the same disk).
     """
     needed = 0
+    claimed: set = set()
     for a in plan:
         if a.is_skip or a.operation != 'copy':
             continue
-        if _same_file(a.source, a.dest):
+        _, present = _resolve_dest(a.source, a.dest, claimed)
+        if present:
             continue
         try:
             needed += a.source.stat().st_size
@@ -539,9 +676,11 @@ def plan_migration(results:     list,
             source=Path(meta.file_path), dest=dest,
             operation=operation, skip_reason='',
             device=meta.device_type, frame_type=meta.frame_type,
-            target=meta.object_name, year=_year_folder(meta),
+            target=meta.object_name,
+            year=_session_year(meta, session) if session else _year_folder(meta),
             session=session.label if session else '',
-            review_reason=session.review_reason if session else '',
+            review_reason=((session.review_reason if session else '')
+                           or _frame_problem(meta)),
         ))
 
     return plan
@@ -587,7 +726,7 @@ def print_plan(plan: list, verbose: bool = False) -> None:
             for s in skips[:10]:
                 print(f"    • {s.source.name}: {s.skip_reason}")
             if len(skips) > 10:
-                print(f"    … and {len(skips) - 10} more (see migration.log)")
+                print(f"    … and {len(skips) - 10} more (see the migration log)")
 
 
 def print_summary(plan: list, dry_run: bool = True) -> None:
@@ -626,19 +765,42 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
         print(f"    • {t}")
 
     # Rev 3 — night sessions and review flags
-    night_sessions: dict = {}
+    sess_total: dict = {}
+    sess_flags: dict = {}
     for a in plan:
-        if not a.is_skip and a.session:
-            k = (a.year, a.target, a.device, a.session, a.review_reason)
-            night_sessions[k] = night_sessions.get(k, 0) + 1
-    if night_sessions:
-        flagged = {k: n for k, n in night_sessions.items() if k[4]}
+        if a.is_skip or not a.session:
+            continue
+        k = (a.year, a.target, a.device, a.session)
+        sess_total[k] = sess_total.get(k, 0) + 1
+        if a.review_reason:
+            flags = sess_flags.setdefault(k, {})
+            flags[a.review_reason] = flags.get(a.review_reason, 0) + 1
+    if sess_total:
+        whole = {k: r for k, f in sess_flags.items() for r in f if r not in _PER_FRAME_REASONS}
+        failed = {k: f['failed frame'] for k, f in sess_flags.items() if 'failed frame' in f}
         print(f"  {'─' * (W - 2)}")
-        print(f"  Night sessions: {len(night_sessions)}  "
-              f"({len(flagged)} flagged for review)")
-        for (year, target, device, label, reason), n in sorted(flagged.items()):
+        print(f"  Night sessions: {len(sess_total)}  ({len(whole)} flagged for review)")
+        for k, reason in sorted(whole.items()):
+            year, target, device, label = k
             print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
-                  f"{n} file(s) — {reason}")
+                  f"{sess_total[k]} file(s) — {reason}")
+        if failed:
+            print(f"  Failed frames : {sum(failed.values())} moved to _Review "
+                  f"in {len(failed)} session(s)")
+            for k, n in sorted(failed.items()):
+                year, target, device, label = k
+                pct = 100 * n / sess_total[k]
+                note = '  — consider discarding the session' if pct >= 50 else ''
+                print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
+                      f"{n} failed ({pct:.0f}% of session){note}")
+    truncated = [a for a in plan if not a.is_skip and a.review_reason == 'truncated file']
+    if truncated:
+        print(f"  Truncated     : {len(truncated)} file(s) moved to _Review "
+              f"(shorter than their headers say)")
+        for a in truncated[:10]:
+            print(f"    ⚑ {a.source.name}")
+        if len(truncated) > 10:
+            print(f"    … and {len(truncated) - 10} more")
     print('=' * W)
 
 
@@ -664,6 +826,7 @@ def execute_plan(plan:     list,
     if not dry_run and output_root is not None:
         _create_pi_placeholders(plan, output_root)
 
+    claimed: set = set()
     for action in plan:
 
         if action.is_skip:
@@ -676,7 +839,8 @@ def execute_plan(plan:     list,
             if not action.source.exists():
                 logger.warning(f"DRY-RUN: source missing: {action.source}")
                 stats['errors'] += 1
-            elif action.operation == 'copy' and _same_file(action.source, action.dest):
+            elif _resolve_dest(action.source, action.dest, claimed,
+                               match_existing=(action.operation == 'copy'))[1]:
                 stats['already_present'] += 1
             else:
                 key = 'copied' if action.operation == 'copy' else 'moved'
@@ -686,12 +850,15 @@ def execute_plan(plan:     list,
         # ── Live execution ────────────────────────────────────────────────────
         dest = None
         try:
-            if action.operation == 'copy' and _same_file(action.source, action.dest):
+            resolved, present = _resolve_dest(
+                action.source, action.dest, claimed,
+                match_existing=(action.operation == 'copy'))
+            if present:
                 stats['already_present'] += 1
-                logger.debug(f"PRESENT {action.dest}  (already copied, skipped)")
+                logger.debug(f"PRESENT {resolved}  (already copied, skipped)")
                 continue
 
-            dest = _make_unique_dest(action.dest)
+            dest = resolved
             dest.parent.mkdir(parents=True, exist_ok=True)
 
             if action.operation == 'copy':
@@ -777,6 +944,7 @@ Examples:
                         help='Actually perform the migration (default: dry-run)')
     parser.add_argument('--move',      action='store_true',
                         help='Move files instead of copying (requires --execute)')
+    parser.add_argument('--version',   action='version', version=version_banner())
     parser.add_argument('--year',      help='Only migrate files from this year, e.g. 2025')
     parser.add_argument('--device',    help='Only migrate files from this device, e.g. SEESTAR_S50')
     parser.add_argument('--target', action='append', metavar='NAME',
@@ -802,6 +970,11 @@ Examples:
     except Exception:
         parser.error(f"unknown timezone '{args.tz}' (example: America/Chicago)")
 
+    print(f"\n  {version_banner()}")
+    mismatch = version_mismatch()
+    if mismatch:
+        print(f"  ⚠  {mismatch}")
+
     source_root = Path(args.source).expanduser()
     output_root = Path(args.output).expanduser()
     dry_run     = not args.execute
@@ -810,8 +983,13 @@ Examples:
     if args.move and not args.execute:
         print("  ⚠  --move has no effect without --execute. Running dry-run.")
 
+    log_path = attach_run_log(dry_run)
+    if mismatch:
+        logger.warning(mismatch)
+
     print(f"\n  Mode      : {'DRY-RUN (use --execute to actually run)' if dry_run else 'EXECUTE'}")
     print(f"  Operation : {operation.upper()}")
+    print(f"  Logs      : surprises.log (scan), {log_path.name} (plan / copy)")
     print(f"  Source    : {source_root}")
     print(f"  Output    : {output_root}")
     if args.year:   print(f"  Year      : {args.year}")
@@ -863,7 +1041,7 @@ Examples:
             print("  ✗  DISK FULL — run stopped. Free space and re-run the same command; "
                   "files already copied are skipped.")
         elif stats['errors']:
-            print("  ⚠  Errors occurred — check migration.log")
+            print("  ⚠  Errors occurred — check the migration log")
 
 
 if __name__ == '__main__':

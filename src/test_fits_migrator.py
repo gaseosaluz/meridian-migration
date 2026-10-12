@@ -50,6 +50,16 @@ from fits_migrator import (
     session_key,
     print_summary,
     check_free_space,
+    is_solar_system_target,
+    _resolve_dest,
+    _exposure_label,
+    _is_failed_frame,
+    _frame_problem,
+    __version__ as MIGRATOR_VERSION,
+    EXTRACTOR_VERSION,
+    version_banner,
+    version_mismatch,
+    attach_run_log,
 )
 
 
@@ -849,7 +859,7 @@ class TestSessionWarnings:
         folder = 'DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-08-05-21-23-06-495'
         ms = [lm(folder, '2025-07-25T00:34:00') for _ in range(50)]
         import logging
-        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+        with caplog.at_level(logging.WARNING, logger='fits_migrator'):
             plan = plan_migration(ms, OUTPUT)
         assert any('date mismatch' in r.message for r in caplog.records)
         assert night(plan[0]) == '2025-07-24_15s'      # trusts capture times
@@ -858,7 +868,7 @@ class TestSessionWarnings:
         folder = 'DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-07-29-00-50-58-376'
         ms = [lm(folder, '2025-07-29T00:51:00') for _ in range(50)]
         import logging
-        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+        with caplog.at_level(logging.WARNING, logger='fits_migrator'):
             plan_migration(ms, OUTPUT)
         assert not [r for r in caplog.records if 'mismatch' in r.message]
 
@@ -866,7 +876,7 @@ class TestSessionWarnings:
         ms = [lm('s', '2025-08-06T21:39:20', device='SEESTAR_S50', exp=10.0,
                  name=f'Light_M 16_10.0s_LP_20250806-2139{i:02d}.fit') for i in range(20)]
         import logging
-        with caplog.at_level(logging.WARNING, logger='fits_extractor'):
+        with caplog.at_level(logging.WARNING, logger='fits_migrator'):
             plan_migration(ms, OUTPUT)
         msgs = [r for r in caplog.records if 'does not match' in r.message]
         assert len(msgs) == 1 and '20 Seestar' in msgs[0].message
@@ -1058,3 +1068,344 @@ class TestDiskSpace:
         monkeypatch.setattr(_shutil, 'copy2', flaky)
         s = execute_plan(plan, dry_run=False, output_root=out)
         assert s['errors'] == 1 and s['copied'] == 3 and s['no_space'] is False
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 5 — collisions, solar-system targets, year-of-night, 2038, S30 Pro
+# ══════════════════════════════════════════════════════════════════════════════
+class TestCollisionSafety:
+    def two_same_name(self, tmp_path):
+        """Two different sessions, same calibration file name, same size AND mtime."""
+        a = tmp_path / 'src' / 's1'; b = tmp_path / 'src' / 's2'
+        a.mkdir(parents=True); b.mkdir(parents=True)
+        fa, fb = a / 'bias_gain_2_bin_1.fits', b / 'bias_gain_2_bin_1.fits'
+        fa.write_bytes(b'A' * 100); fb.write_bytes(b'B' * 100)
+        os.utime(fa, (1_700_000_000, 1_700_000_000)); os.utime(fb, (1_700_000_000, 1_700_000_000))
+        return [make_meta(file_path=str(f), file_name=f.name, frame_type='BIAS',
+                          object_name='', observation_year=2026) for f in (fa, fb)]
+
+    def test_same_name_same_size_same_time_both_kept(self, tmp_path):
+        out = tmp_path / 'out'
+        plan = plan_migration(self.two_same_name(tmp_path), out)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['copied'] == 2 and s['already_present'] == 0
+        contents = sorted(p.read_bytes()[:1] for p in out.rglob('*.fits'))
+        assert contents == [b'A', b'B']
+
+    def test_rerun_with_collisions_is_idempotent(self, tmp_path):
+        out = tmp_path / 'out'
+        plan = plan_migration(self.two_same_name(tmp_path), out)
+        execute_plan(plan, dry_run=False, output_root=out)
+        s2 = execute_plan(plan, dry_run=False, output_root=out)
+        assert s2['copied'] == 0 and s2['already_present'] == 2
+        assert len(list(out.rglob('*.fits'))) == 2
+
+    def test_dry_run_predicts_collision_copies(self, tmp_path):
+        out = tmp_path / 'out'
+        plan = plan_migration(self.two_same_name(tmp_path), out)
+        s = execute_plan(plan, dry_run=True)
+        assert s['copied'] == 2 and s['already_present'] == 0
+
+    def test_resolve_dest_order(self, tmp_path):
+        src = tmp_path / 'f.fits'; src.write_bytes(b'x')
+        claimed = set()
+        d = tmp_path / 'out' / 'f.fits'
+        assert _resolve_dest(src, d, claimed) == (d, False)
+        assert _resolve_dest(src, d, claimed)[0].name == 'f_2.fits'
+        assert _resolve_dest(src, d, claimed)[0].name == 'f_3.fits'
+
+
+class TestSolarSystem:
+    @pytest.mark.parametrize('name,expected', [
+        ('Moon', True), ('moon', True), ('Jupiter', True), ('Sun', True),
+        ('Comet NEOWISE', True), ('M 31', False), ('Unknown', False), ('Mars Rover', False)])
+    def test_detection(self, name, expected):
+        assert is_solar_system_target(name) is expected
+
+    def test_moon_not_flagged_for_short_exposure(self):
+        ms = [lm('mn', '2026-02-28T20:00:00', target='Moon', exp=0.003125) for _ in range(20)]
+        plan = plan_migration(ms, OUTPUT)
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in plan)
+        assert plan[0].dest.parent.name == '2026-02-28_3.125ms'
+
+    def test_dso_with_short_session_still_flagged(self):
+        ms = [lm('x', '2026-02-28T20:00:00', target='M 42', exp=1.0) for _ in range(20)]
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan_migration(ms, OUTPUT))
+
+    @pytest.mark.parametrize('e,label', [(0.000125, '_0.125ms'), (0.0001, '_0.1ms'),
+                                         (0.003125, '_3.125ms'), (0.5, '_500ms'),
+                                         (1.0, '_1s'), (30.0, '_30s'), (7.5, '_7.5s')])
+    def test_exposure_label(self, e, label):
+        assert _exposure_label([e]) == label
+
+
+class TestYearOfNight:
+    def test_new_years_eve_session_stays_in_old_year(self):
+        ms = ([lm('nye', f'2025-12-31T23:{mm:02d}:00', exp=60.0, target='M 33') for mm in range(0, 60, 6)] +
+              [lm('nye', f'2026-01-01T00:{mm:02d}:00', exp=60.0, target='M 33') for mm in range(0, 60, 6)])
+        for m in ms:
+            m.observation_year = int(m.observation_date[:4])
+        plan = plan_migration(ms, OUTPUT)
+        assert {a.dest.parts[-5:-1] for a in plan} == {('2025', 'M 33', 'Lights', '2025-12-31_60s')}
+        assert {a.year for a in plan} == {'2025'}
+
+    def test_normal_session_year_unchanged(self):
+        ms = [lm('n', '2026-03-05T22:00:00', exp=60.0, target='M 42') for _ in range(12)]
+        for m in ms: m.observation_year = 2026
+        assert {a.year for a in plan_migration(ms, OUTPUT)} == {'2026'}
+
+    def test_calibration_year_still_from_header(self):
+        d = lm('c', '2026-03-05T22:00:00', ftype='DARK', target='')
+        d.observation_year = 2026
+        assert plan_migration([d], OUTPUT)[0].year == '2026'
+
+
+class TestDwarf2038:
+    def test_bad_header_year_falls_back_to_filename_time_and_path_year(self):
+        name = 'Barnard 33_30s60_Duo-Band_20260324-203732172_36C.fits'
+        ms = [make_meta(file_path=f'/src/2026/s/{name[:-5]}{i}.fits',
+                        file_name=name.replace('2037', f'20{i:02d}'),
+                        device_type='DWARF_MINI', object_name='Barnard 33',
+                        observation_date='2038-01-01T00:07:00', observation_year=None,
+                        exposure_time=30.0) for i in range(30, 50)]
+        plan = plan_migration(ms, OUTPUT)
+        assert {a.year for a in plan} == {'2026'}
+        assert {a.dest.parent.name for a in plan} == {'2026-03-24_30s'}
+
+    def test_calibration_with_2038_goes_to_path_year(self):
+        d = make_meta(file_path='/src/2026/DWARF Mini/dark_exp_10_gain_60_bin_1_33C_stack_3.fits',
+                      file_name='dark_exp_10_gain_60_bin_1_33C_stack_3.fits',
+                      frame_type='DARK', object_name='', device_type='DWARF_MINI',
+                      observation_year=None)
+        assert plan_migration([d], OUTPUT)[0].dest.parts[-4:-1] == ('2026', '_Calibration', 'Dark')
+
+
+class TestS30ProSessions:
+    def test_s30_pro_uses_filename_local_time(self):
+        ms = [lm('s30', '2026-10-12T01:31:50', device='SEESTAR_S30_PRO', exp=30.0, target='M 31',
+                 name=f'Light_M 31_30.0s_IRCUT_20261011-2031{i:02d}.fit') for i in range(40)]
+        plan = plan_migration(ms, OUTPUT)
+        assert {a.dest.parent.name for a in plan} == {'2026-10-11_30s'}
+
+    def test_s30_pro_header_utc_fallback(self):
+        ms = [lm('s30', '2026-10-12T01:31:50', device='SEESTAR_S30_PRO', exp=30.0,
+                 target='M 31', name=f'frame_{i}.fit') for i in range(40)]
+        assert {a.dest.parent.name for a in plan_migration(ms, OUTPUT)} == {'2026-10-11_30s'}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 6 — failed_ frames go to _Review individually
+# ══════════════════════════════════════════════════════════════════════════════
+def session_with_failed(good=40, failed=5, exp=30.0, folder='m33'):
+    ms = [lm(folder, f'2025-12-31T21:{i % 60:02d}:00', exp=exp, target='M 33',
+             name=f'DWARF_good_{i}.fits') for i in range(good)]
+    ms += [lm(folder, f'2025-12-31T22:{i % 60:02d}:00', exp=exp, target='M 33',
+              name=f'failed_M 33_{i}.fits') for i in range(failed)]
+    return ms
+
+
+class TestFailedFrames:
+    def test_detection(self):
+        assert _is_failed_frame(lm('f', None, name='failed_x.fits'))
+        assert _is_failed_frame(lm('f', None, name='FAILED_x.fits'))
+        assert not _is_failed_frame(lm('f', None, name='light_x.fits'))
+        assert not _is_failed_frame(lm('f', None, name='stacked-5_x.fits'))
+        assert not _is_failed_frame(lm('f', None, name='failed_x.fits', ftype='DARK'))
+
+    def test_failed_frames_go_to_review_good_stay(self):
+        plan = plan_migration(session_with_failed(), OUTPUT)
+        lights = [a for a in plan if FOLDER_LIGHTS in a.dest.parts]
+        review = [a for a in plan if FOLDER_REVIEW in a.dest.parts]
+        assert len(lights) == 40 and len(review) == 5
+        assert {a.dest.parent.name for a in review} == {a.dest.parent.name for a in lights}
+        assert all(a.review_reason == 'failed frame' for a in review)
+        assert all(a.review_reason == '' for a in lights)
+
+    def test_failed_frames_do_not_count_toward_integration(self):
+        # 19 good x 30 s = 9.5 min  (+ 30 failed x 30 s that must NOT count)
+        plan = plan_migration(session_with_failed(good=19, failed=30), OUTPUT)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+        assert any('min of exposure' in a.review_reason for a in plan if 'failed' not in a.source.name)
+
+    def test_all_failed_session_flagged_whole(self):
+        plan = plan_migration(session_with_failed(good=0, failed=40), OUTPUT)
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+        assert all(a.review_reason == 'failed capture' for a in plan)
+
+    def test_merged_layout_failed_goes_to_review(self):
+        plan = plan_migration(session_with_failed(), OUTPUT, split_nights=False)
+        assert sum(FOLDER_REVIEW in a.dest.parts for a in plan) == 5
+
+    def test_summary_counts_session_once_and_reports_percentage(self, capsys):
+        print_summary(plan_migration(session_with_failed(good=40, failed=5), OUTPUT))
+        out = capsys.readouterr().out
+        assert 'Night sessions: 1  (0 flagged for review)' in out
+        assert 'Failed frames : 5 moved to _Review in 1 session(s)' in out
+        assert '5 failed (11% of session)' in out and 'consider discarding' not in out
+
+    def test_summary_suggests_discarding_mostly_failed_session(self, capsys):
+        print_summary(plan_migration(session_with_failed(good=25, failed=25), OUTPUT))
+        out = capsys.readouterr().out
+        assert '50% of session' in out and 'consider discarding the session' in out
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rev 7 — truncated frames go to _Review
+# ══════════════════════════════════════════════════════════════════════════════
+class TestTruncatedFrames:
+    def sess(self, good=40, cut=3, exp=30.0):
+        ms = [lm('s', f'2026-03-01T21:{i % 60:02d}:00', exp=exp, target='M 42',
+                 name=f'good_{i}.fits') for i in range(good)]
+        for i in range(cut):
+            m_ = lm('s', f'2026-03-01T22:{i:02d}:00', exp=exp, target='M 42', name=f'cut_{i}.fits')
+            m_.truncated = True
+            ms.append(m_)
+        return ms
+
+    def test_problem_reasons(self):
+        t_ = lm('f', None, name='x.fits'); t_.truncated = True
+        assert _frame_problem(t_) == 'truncated file'
+        assert _frame_problem(lm('f', None, name='failed_x.fits')) == 'failed frame'
+        assert _frame_problem(lm('f', None, name='ok.fits')) == ''
+
+    def test_truncated_lights_go_to_review_good_stay(self):
+        plan = plan_migration(self.sess(), OUTPUT)
+        cut = [a for a in plan if a.source.name.startswith('cut_')]
+        good = [a for a in plan if a.source.name.startswith('good_')]
+        assert all(FOLDER_REVIEW in a.dest.parts and a.review_reason == 'truncated file' for a in cut)
+        assert all(FOLDER_LIGHTS in a.dest.parts for a in good)
+
+    def test_truncated_do_not_count_toward_integration(self):
+        plan = plan_migration(self.sess(good=19, cut=30), OUTPUT)         # 9.5 min of good frames
+        assert all(FOLDER_REVIEW in a.dest.parts for a in plan)
+
+    def test_truncated_stack_goes_to_review(self):
+        ms = self.sess(cut=0)
+        st = lm('s', '2026-03-01T22:30:00', name='stacked-40_M42.fits', target='M 42'); st.truncated = True
+        plan = plan_migration(ms + [st], OUTPUT)
+        assert FOLDER_REVIEW in [a for a in plan if a.source.name == 'stacked-40_M42.fits'][0].dest.parts
+
+    def test_truncated_calibration_goes_to_review(self):
+        d = lm('c', None, ftype='DARK', target='', name='dark_exp_10_gain_60_bin_1_33C_stack_3.fits')
+        d.truncated = True
+        d.observation_year = 2026
+        assert plan_migration([d], OUTPUT)[0].dest.parts[-3:-1] == ('2026', FOLDER_REVIEW)
+
+    def test_truncated_calibration_with_target(self):
+        d = lm('c', None, ftype='FLAT', target='M 42', name='flat_gain_2_bin_1.fits')
+        d.truncated = True
+        assert plan_migration([d], OUTPUT)[0].dest.parts[-3:-1] == ('M 42', FOLDER_REVIEW)
+
+    def test_merged_layout(self):
+        plan = plan_migration(self.sess(), OUTPUT, split_nights=False)
+        assert sum(FOLDER_REVIEW in a.dest.parts for a in plan) == 3
+
+    def test_summary_lists_truncated_files(self, capsys):
+        print_summary(plan_migration(self.sess(), OUTPUT))
+        out = capsys.readouterr().out
+        assert 'Truncated     : 3 file(s) moved to _Review' in out and 'cut_0.fits' in out
+        assert 'Night sessions: 1  (0 flagged for review)' in out
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Versioning and run logs
+# ══════════════════════════════════════════════════════════════════════════════
+import re as _re
+import subprocess
+import sys as _sys
+import logging as _lg
+from datetime import datetime as _dt
+import fits_migrator as _fm
+
+HERE = Path(__file__).parent
+
+
+class TestVersioning:
+    def test_format_is_semver(self):
+        assert _re.fullmatch(r'\d+\.\d+\.\d+', MIGRATOR_VERSION)
+
+    def test_extractor_and_migrator_versions_match(self):
+        from fits_metadata_extractor import __version__ as ev
+        assert ev == MIGRATOR_VERSION == EXTRACTOR_VERSION
+
+    def test_changelog_top_entry_is_current_version(self):
+        text = (HERE / 'CHANGELOG.md').read_text()
+        first = _re.search(r'^## \[(\d+\.\d+\.\d+)\]', text, _re.MULTILINE)
+        assert first and first.group(1) == MIGRATOR_VERSION, (
+            "CHANGELOG.md's newest entry must be the current version — "
+            "update it when you bump __version__")
+
+    def test_banner(self):
+        assert version_banner() == f"fits_migrator {MIGRATOR_VERSION} (extractor {EXTRACTOR_VERSION})"
+
+    def test_no_mismatch_warning_when_equal(self):
+        assert version_mismatch() is None
+
+    def test_mismatch_warning(self, monkeypatch):
+        monkeypatch.setattr(_fm, 'EXTRACTOR_VERSION', '0.1.0')
+        msg = version_mismatch()
+        assert msg and '0.1.0' in msg and MIGRATOR_VERSION in msg
+
+    def test_cli_version_flag(self):
+        for script, expect in (('fits_migrator.py', f'fits_migrator {MIGRATOR_VERSION}'),
+                               ('fits_metadata_extractor.py', f'fits_metadata_extractor {MIGRATOR_VERSION}'),
+                               ('session_report.py', f'fits_migrator {MIGRATOR_VERSION}')):
+            if not (HERE / script).exists():
+                continue
+            r = subprocess.run([_sys.executable, str(HERE / script), '--version'],
+                               capture_output=True, text=True, cwd=HERE)
+            assert r.returncode == 0 and expect in r.stdout, (script, r.stdout, r.stderr)
+
+    def test_run_prints_banner_and_log_names(self, tmp_path):
+        (tmp_path / 'src').mkdir()
+        r = subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'),
+                            str(tmp_path / 'src'), str(tmp_path / 'out'), '--summary'],
+                           capture_output=True, text=True, cwd=tmp_path,
+                           env={**__import__('os').environ, 'PYTHONPATH': str(HERE)})
+        assert version_banner() in r.stdout
+        assert 'Logs      : surprises.log (scan), migration.log (plan / copy)' in r.stdout
+        assert (tmp_path / 'migration.log').exists()
+        assert MIGRATOR_VERSION in (tmp_path / 'migration.log').read_text()
+        assert MIGRATOR_VERSION in (tmp_path / 'surprises.log').read_text()
+
+
+class TestRunLog:
+    def cleanup(self):
+        for h in [h for h in _fm.logger.handlers if h.get_name() == 'run-log']:
+            _fm.logger.removeHandler(h); h.close()
+
+    def test_dry_run_log_name(self, tmp_path):
+        try:
+            assert attach_run_log(True, tmp_path).name == 'migration.log'
+        finally:
+            self.cleanup()
+
+    def test_execute_log_is_timestamped_and_kept(self, tmp_path):
+        try:
+            p = attach_run_log(False, tmp_path, now=_dt(2026, 10, 12, 20, 45, 7))
+            assert p.name == 'migration_20261012_204507.log'
+        finally:
+            self.cleanup()
+
+    def test_header_has_version_environment_and_mode(self, tmp_path):
+        try:
+            p = attach_run_log(False, tmp_path)
+            _fm.logger.debug('COPY a -> b')
+            for h in _fm.logger.handlers: h.flush()
+            text = p.read_text()
+            assert version_banner() in text and 'Python' in text and 'astropy' in text
+            assert 'mode=execute' in text and 'COPY a -> b' in text
+        finally:
+            self.cleanup()
+
+    def test_second_run_replaces_handler(self, tmp_path):
+        try:
+            attach_run_log(True, tmp_path)
+            attach_run_log(True, tmp_path)
+            assert sum(h.get_name() == 'run-log' for h in _fm.logger.handlers) == 1
+        finally:
+            self.cleanup()

@@ -6,7 +6,8 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Sprint 2, Phase 1 - Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
+Version 0.8.0 - see CHANGELOG.md
+Sprint 2, Phase 1 - Rev 8 (truncated-file detection); Rev 7 (one summary warning for implausible dates); Rev 6 (S30 Pro, implausible-date guard); Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
   - DWARF 3 (firmware pre-1.4  / TELESCOP='DWARFIII')
@@ -50,10 +51,24 @@ import re
 import sys
 import json
 import logging
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+# One shared project version for all files (bump together; see RELEASING.md).
+__version__ = "0.8.0"
+
+
+def environment_line() -> str:
+    """Python / library versions, for the log header (reproducing a run later)."""
+    import platform
+    import astropy
+    import numpy
+    return (f"Python {platform.python_version()}, astropy {astropy.__version__}, "
+            f"numpy {numpy.__version__}")
 from astropy.io import fits
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,15 +100,20 @@ DEVICE_SIGNATURES: dict = {
         # TELESCOP embeds serial: 'S50_40d24ed8' — handled separately below
         "CREATOR":    ["ZWO Seestar S50"],
         "INSTRUMENT": ["Seestar S50"],
+        "TELESCOPE_PREFIX": ["S50_"],           # serial suffix, e.g. 'S50_40d24ed8'
         "image_size": (1080, 1920),             # portrait orientation
         "path_names": ["seestar s50", "seestar_s50", "seestar50", "s50"],
     },
     # ── Add future devices here without touching any other code ──────────────
-    # "SEESTAR_S30_PRO": {
-    #     "CREATOR":    ["ZWO Seestar S30 Pro"],
-    #     "INSTRUMENT": ["Seestar S30 Pro"],
-    #     "path_names": ["seestar s30 pro", "seestar_s30_pro", "s30pro"],
-    # },
+    "SEESTAR_S30_PRO": {
+        # First seen 2026-10: TELESCOP='S30 Pro_da267bef', CREATOR='ZWO Seestar S30 Pro',
+        # 2160x3840 portrait.  Headers also carry BIAS and DATE-EXP.
+        "CREATOR":    ["ZWO Seestar S30 Pro"],
+        "INSTRUMENT": ["Seestar S30 Pro"],
+        "TELESCOPE_PREFIX": ["S30 Pro_"],
+        "image_size": (2160, 3840),
+        "path_names": ["seestar s30 pro", "seestar_s30_pro", "s30pro", "s30 pro"],
+    },
     # "ASIAIR": {
     #     "CREATOR": ["ASIAIR"],
     #     "path_names": ["asiair"],
@@ -144,7 +164,8 @@ _RE_FLAT = re.compile(r'flat_gain_(\d+)_bin_\d+', re.IGNORECASE)
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
-def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
+def setup_logging(log_file: Optional[str] = 'surprises.log',
+                  name: str = 'fits_extractor') -> logging.Logger:
     """
     Two-channel logging:
       Console : INFO and above  (normal progress)
@@ -154,7 +175,7 @@ def setup_logging(log_file: Optional[str] = 'surprises.log') -> logging.Logger:
     Rev 3: opened in WRITE mode ('w') so each scan produces a fresh log.
     Delete surprises.log manually only if you want to compare runs back-to-back.
     """
-    logger = logging.getLogger('fits_extractor')
+    logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
 
     fmt = logging.Formatter(
@@ -247,6 +268,7 @@ class FITSMetadata:
     is_valid:        bool = True
     warnings:        list = field(default_factory=list)
     unknown_headers: dict = field(default_factory=dict)
+    truncated:       bool = False     # Rev 8: file shorter than its header says
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -365,7 +387,8 @@ def detect_device(header: fits.Header,
     for device_name, sigs in DEVICE_SIGNATURES.items():
         if telescop and telescop in sigs.get('TELESCOPE', []):
             return device_name, warnings, 'header'
-        if device_name == 'SEESTAR_S50' and telescop.upper().startswith('S50_'):
+        if telescop and any(telescop.upper().startswith(p.upper())
+                            for p in sigs.get('TELESCOPE_PREFIX', [])):
             return device_name, warnings, 'header'
         if creator and creator in sigs.get('CREATOR', []):
             return device_name, warnings, 'header'
@@ -386,6 +409,7 @@ def detect_device(header: fits.Header,
         (3856, 2180): 'DWARF_3',
         (1920, 1080): 'DWARF_MINI',
         (1080, 1920): 'SEESTAR_S50',
+        (2160, 3840): 'SEESTAR_S30_PRO',
     }
     if (naxis1, naxis2) in dim_map:
         device = dim_map[(naxis1, naxis2)]
@@ -511,6 +535,18 @@ def get_exposure(header: fits.Header) -> Optional[float]:
     return None
 
 
+MIN_PLAUSIBLE_YEAR = 2015
+
+# Collected during a scan and reported once at the end (not one warning per file)
+_implausible_dates: list = []
+_truncated_files:   list = []
+
+
+def is_plausible_year(year: int) -> bool:
+    """False for clock-glitch years such as the DWARF Mini's 2038 default."""
+    return MIN_PLAUSIBLE_YEAR <= year <= datetime.now().year + 1
+
+
 def parse_observation_date(header: fits.Header) -> tuple:
     """
     Parse observation date/time from header.
@@ -525,6 +561,11 @@ def parse_observation_date(header: fits.Header) -> tuple:
 
     try:
         dt = datetime.fromisoformat(date_str.rstrip('Z').replace(' ', 'T'))
+        if not is_plausible_year(dt.year):
+            _implausible_dates.append(date_str)
+            logger.debug(f"Implausible observation date '{date_str}' "
+                         f"(device clock not set?) — ignoring it")
+            return None, None, None
         return date_str, dt.year, dt.month
     except ValueError:
         logger.warning(f"Could not parse observation date: '{date_str}'")
@@ -561,6 +602,8 @@ _KNOWN_HEADERS: frozenset = frozenset({
     'IMAGEW', 'IMAGEH',
     # Seestar wide-angle camera flag (Rev 5): WIDECAM = 0 means main camera
     'WIDECAM',
+    # Seestar S30 Pro headers (Rev 6)
+    'BIAS', 'DATE-EXP',
     # Frame classification
     'IMAGETYP',
     # Site / location
@@ -608,6 +651,14 @@ def _is_known_header(key: str) -> bool:
 # Main extraction function
 # ──────────────────────────────────────────────────────────────────────────────
 
+@contextmanager
+def _capture_warnings():
+    """Record warnings raised while a file is read (re-emitted by the caller)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        yield caught
+
+
 def extract_metadata(fits_path: Path) -> FITSMetadata:
     """
     Extract all available metadata from a single FITS file.
@@ -633,7 +684,8 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
         logger.warning(msg)
 
     try:
-        with fits.open(fits_path, ignore_missing_simple=True) as hdul:
+        with _capture_warnings() as caught, \
+                fits.open(fits_path, ignore_missing_simple=True) as hdul:
             header = hdul[0].header
 
             # ── Device ────────────────────────────────────────────────────────
@@ -730,6 +782,21 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
                     logger.info(
                         f"Unknown header [{fits_path.name}] {key} = {val}")
 
+            # ── Truncation check (Rev 8) ──────────────────────────────────────
+            # A file shorter than its own header says is a damaged / unfinished
+            # copy.  Same test astropy uses, plus its own warning as a backstop.
+            info = hdul[0].fileinfo() or {}
+            expected = info.get('datLoc', 0) + info.get('datSpan', 0)
+            short = bool(expected) and fits_path.stat().st_size < expected
+            warned = any('truncated' in str(w.message).lower() for w in caught)
+            if short or warned:
+                meta.truncated = True
+                meta.warnings.append("File is truncated (shorter than its header says)")
+                _truncated_files.append(fits_path.name)
+            for w in caught:                       # keep every other astropy warning visible
+                if 'truncated' not in str(w.message).lower():
+                    warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+
     except Exception as exc:
         meta.is_valid = False
         meta.warnings.append(f"Error reading FITS: {exc}")
@@ -757,11 +824,24 @@ def scan_directory(root_path: Path, recursive: bool = True) -> list:
 
     logger.info(f"Found {len(fits_files)} FITS file(s) under {root_path}")
 
+    _implausible_dates.clear()
+    _truncated_files.clear()
     results = []
     for i, fits_file in enumerate(fits_files, 1):
         logger.debug(f"[{i}/{len(fits_files)}] {fits_file.name}")
         results.append(extract_metadata(fits_file))
 
+    if _implausible_dates:
+        logger.warning(
+            f"{len(_implausible_dates)} file(s) had an implausible observation date "
+            f"(e.g. '{_implausible_dates[0]}') — device clock not set? Those dates "
+            f"were ignored; the year comes from the folder path and times from the "
+            f"filename.")
+    if _truncated_files:
+        logger.warning(
+            f"{len(_truncated_files)} truncated file(s) found "
+            f"(e.g. {_truncated_files[0]}) — shorter than their headers say; "
+            f"a download or capture may have been cut off.")
     return results
 
 
@@ -876,7 +956,10 @@ Examples:
     parser.add_argument('--scan',    action='store_true', help='Scan directory recursively')
     parser.add_argument('--json',    action='store_true', help='Output as JSON')
     parser.add_argument('--summary', action='store_true', help='Summary statistics only')
+    parser.add_argument('--version', action='version',
+                        version=f'fits_metadata_extractor {__version__}')
     args = parser.parse_args()
+    logger.debug(f"fits_metadata_extractor {__version__}; {environment_line()}")
 
     target = Path(args.path).expanduser()
 

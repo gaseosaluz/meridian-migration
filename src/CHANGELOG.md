@@ -1,0 +1,67 @@
+# Changelog
+
+One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.py`,
+`session_report.py`). Versions bump together; see `RELEASING.md`.
+Dates were not recorded for 0.1.0 – 0.7.0.
+
+## [0.8.0] - 2026-10-12
+### Added
+- Failed (`failed_…`) frames go to `_Review` individually; the summary shows what
+  share of each session failed and suggests discarding sessions at 50% or more.
+- Truncated files (shorter than their own header says) are detected and go to `_Review`.
+- Visible version: `--version`, a banner at the start of every run, and the version,
+  Python and astropy versions written to the top of the logs.
+- A mismatch warning when the migrator and extractor are different versions.
+- A log file per run: `migration.log` for dry runs, `migration_<time>.log` for `--execute`
+  (a record of what was copied). Scan surprises stay in `surprises.log`.
+### Changed
+- One warning (with a count) for implausible observation dates and for truncated files,
+  instead of one per file.
+### Fixed
+- `migration.log` was never written (the scan log and migrator log shared one file).
+
+## [0.7.0]
+### Added
+- Seestar S30 Pro support (`BIAS`, `DATE-EXP` headers known).
+- Implausible header dates (e.g. the DWARF Mini's 2038) are ignored; the year comes
+  from the folder path and times from the filename.
+- Moon, Sun, planets and comets are exempt from the minimum-exposure rule;
+  sub-second exposures are labelled in milliseconds.
+- The year folder follows the session's evening date (New Year's Eve sessions stay together).
+### Fixed
+- Files with the same name, size and time from different sessions (DWARF calibration
+  files) could be treated as already copied; each now gets its own destination.
+
+## [0.6.0]
+### Added
+- `--target` filter (repeatable).
+- Re-running `--execute` is safe: identical files are reported as "already present".
+- Free-space check before copying; a clean stop (partial file removed) if the disk fills.
+
+## [0.5.0]
+### Added
+- Night splitting: `Lights/<evening date>_<exposure>/`, with the evening convention
+  (a session starting before 12:00 belongs to the previous evening), Seestar local
+  time from the filename (UTC header fallback), `_sub` folders merged with their
+  session, aborted / Unknown sessions to `_Review`, and `--merge-nights` for the old layout.
+- `session_report.py`: read-only preview of sessions.
+- `WIDECAM` is a known header.
+
+## [0.4.0]
+### Fixed
+- Seestar `Stacked_N_…` files are routed to `Finals/Device/`; `IMAGEW`/`IMAGEH` are
+  known headers; duplicate log lines removed.
+
+## [0.3.0]
+### Added
+- `Finals/Siril/` placeholder next to `Finals/Device/` and `Finals/PixInsight/`.
+
+## [0.2.0]
+### Added
+- Phase 2 migrator: dry-run by default, copy or move, Year/Target/Lights layout,
+  shared `_Calibration`, `_Review`.
+
+## [0.1.0]
+### Added
+- Phase 1 metadata extractor: device detection, frame classification, calibration
+  filename parsing, `surprises.log`.
