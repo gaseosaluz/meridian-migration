@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Version 0.8.0 - see CHANGELOG.md
+Version 0.8.1 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -93,7 +93,7 @@ from fits_metadata_extractor import (
 )
 
 # One shared project version (must equal the extractor's; see RELEASING.md)
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 try:
     from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
 except ImportError:                                  # extractor older than 0.8.0
@@ -776,29 +776,33 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
             flags = sess_flags.setdefault(k, {})
             flags[a.review_reason] = flags.get(a.review_reason, 0) + 1
     if sess_total:
-        whole = {k: r for k, f in sess_flags.items() for r in f if r not in _PER_FRAME_REASONS}
+        # (night, reason) -> number of files carrying that reason.  Several capture
+        # folders can share one night label, so never print the night's total here.
+        whole = {(k, r): n for k, f in sess_flags.items()
+                 for r, n in f.items() if r not in _PER_FRAME_REASONS}
         failed = {k: f['failed frame'] for k, f in sess_flags.items() if 'failed frame' in f}
         print(f"  {'─' * (W - 2)}")
-        print(f"  Night sessions: {len(sess_total)}  ({len(whole)} flagged for review)")
-        for k, reason in sorted(whole.items()):
+        print(f"  Nights        : {len(sess_total)}  "
+              f"({len(whole)} session(s) flagged for review)")
+        for (k, reason), n in sorted(whole.items()):
             year, target, device, label = k
             print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
-                  f"{sess_total[k]} file(s) — {reason}")
+                  f"{n} file(s) — {reason}")
         if failed:
             print(f"  Failed frames : {sum(failed.values())} moved to _Review "
                   f"in {len(failed)} session(s)")
             for k, n in sorted(failed.items()):
                 year, target, device, label = k
                 pct = 100 * n / sess_total[k]
-                note = '  — consider discarding the session' if pct >= 50 else ''
+                note = '  — consider discarding that night' if pct >= 50 else ''
                 print(f"    ⚑ {year}/{target}/_Review/{label}  [{device}]  "
-                      f"{n} failed ({pct:.0f}% of session){note}")
+                      f"{n} failed ({pct:.0f}% of that night){note}")
     truncated = [a for a in plan if not a.is_skip and a.review_reason == 'truncated file']
     if truncated:
         print(f"  Truncated     : {len(truncated)} file(s) moved to _Review "
               f"(shorter than their headers say)")
         for a in truncated[:10]:
-            print(f"    ⚑ {a.source.name}")
+            print(f"    ⚑ {a.source.parent.name}/{a.source.name}")
         if len(truncated) > 10:
             print(f"    … and {len(truncated) - 10} more")
     print('=' * W)

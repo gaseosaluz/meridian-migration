@@ -4,6 +4,15 @@ One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.p
 `session_report.py`). Versions bump together; see `RELEASING.md`.
 Dates were not recorded for 0.1.0 – 0.7.0.
 
+## [0.8.1] - 2026-10-12
+### Fixed
+- The dry-run summary printed a night's TOTAL file count next to a flagged session
+  (e.g. 1190 files for a 2-frame aborted start). It now counts only the flagged files.
+  (Routing was always correct; only the summary was wrong.)
+### Changed
+- The summary says "Nights" and "of that night" (several capture folders can share one night).
+- Truncated-file list shows `folder/filename` (DWARF calibration names repeat).
+
 ## [0.8.0] - 2026-10-12
 ### Added
 - Failed (`failed_…`) frames go to `_Review` individually; the summary shows what

@@ -1241,14 +1241,14 @@ class TestFailedFrames:
     def test_summary_counts_session_once_and_reports_percentage(self, capsys):
         print_summary(plan_migration(session_with_failed(good=40, failed=5), OUTPUT))
         out = capsys.readouterr().out
-        assert 'Night sessions: 1  (0 flagged for review)' in out
+        assert 'Nights        : 1  (0 session(s) flagged for review)' in out
         assert 'Failed frames : 5 moved to _Review in 1 session(s)' in out
-        assert '5 failed (11% of session)' in out and 'consider discarding' not in out
+        assert '5 failed (11% of that night)' in out and 'consider discarding' not in out
 
     def test_summary_suggests_discarding_mostly_failed_session(self, capsys):
         print_summary(plan_migration(session_with_failed(good=25, failed=25), OUTPUT))
         out = capsys.readouterr().out
-        assert '50% of session' in out and 'consider discarding the session' in out
+        assert '50% of that night' in out and 'consider discarding that night' in out
 
 
 
@@ -1307,7 +1307,7 @@ class TestTruncatedFrames:
         print_summary(plan_migration(self.sess(), OUTPUT))
         out = capsys.readouterr().out
         assert 'Truncated     : 3 file(s) moved to _Review' in out and 'cut_0.fits' in out
-        assert 'Night sessions: 1  (0 flagged for review)' in out
+        assert 'Nights        : 1  (0 session(s) flagged for review)' in out
 
 
 
@@ -1409,3 +1409,43 @@ class TestRunLog:
             assert sum(h.get_name() == 'run-log' for h in _fm.logger.handlers) == 1
         finally:
             self.cleanup()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.8.1 — summary counts only the files that carry the reason
+# ══════════════════════════════════════════════════════════════════════════════
+def night_with_aborted_start(good_each=594):
+    """Like M 45 on 2026-01-02: a 2-frame aborted start plus two real sessions, same night + exposure."""
+    ms = [lm('aborted', '2026-01-02T18:58:00', name=f'a{i}.fits', target='M 45', exp=10.0) for i in range(2)]
+    ms += [lm('s1', f'2026-01-02T19:{i % 60:02d}:00', name=f's1_{i}.fits', target='M 45', exp=10.0) for i in range(good_each)]
+    ms += [lm('s2', f'2026-01-02T21:{i % 60:02d}:00', name=f's2_{i}.fits', target='M 45', exp=10.0) for i in range(good_each)]
+    return ms
+
+
+class TestSummaryCountsFlaggedFilesOnly:
+    def test_routing_is_per_session(self):
+        plan = plan_migration(night_with_aborted_start(), OUTPUT)
+        assert sum(FOLDER_REVIEW in a.dest.parts for a in plan) == 2
+        assert sum(FOLDER_LIGHTS in a.dest.parts for a in plan) == 1188
+
+    def test_summary_shows_2_files_not_the_nights_total(self, capsys):
+        print_summary(plan_migration(night_with_aborted_start(), OUTPUT))
+        out = capsys.readouterr().out
+        assert '2 file(s) — only' in out and '1190 file(s)' not in out
+        assert 'Total planned : 1190' in out
+
+    def test_two_sessions_with_different_reasons_listed_separately(self, capsys):
+        ms = night_with_aborted_start(good_each=60)
+        ms += [lm('u', '2026-01-02T20:00:00', name=f'u{i}.fits', target='Unknown', exp=10.0) for i in range(50)]
+        print_summary(plan_migration(ms, OUTPUT))
+        out = capsys.readouterr().out
+        assert '2 file(s) — only' in out and '50 file(s) — target is Unknown' in out
+
+    def test_truncated_listing_shows_folder_names(self, capsys):
+        a = lm('session_a', None, ftype='FLAT', target='', name='flat_gain_2_bin_1_ir_0.fits')
+        b = lm('session_b', None, ftype='FLAT', target='', name='flat_gain_2_bin_1_ir_0.fits')
+        a.truncated = b.truncated = True
+        print_summary(plan_migration([a, b], OUTPUT))
+        out = capsys.readouterr().out
+        assert 'session_a/flat_gain_2_bin_1_ir_0.fits' in out and 'session_b/flat_gain_2_bin_1_ir_0.fits' in out
