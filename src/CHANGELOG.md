@@ -1,8 +1,24 @@
 # Changelog
 
 One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.py`,
-`session_report.py`). Versions bump together; see `RELEASING.md`.
+`session_report.py`, `copy_verify.sh`). Versions bump together; see `RELEASING.md`.
 Dates were not recorded for 0.1.0 – 0.7.0.
+
+## [0.9.1] - 2026-10-13
+### Added
+- A dry run now prints a `Plan check` line (would copy / already present / skipped / missing
+  sources). Before, "already present" was only visible after `--execute`, so a dry run
+  could not be used to verify an existing copy.
+- The reason for a flagged night now says how many sub-frames failed or were truncated
+  (e.g. "329 of 335 sub-frames failed or truncated").
+- Each truncated file is logged (debug) with its full path, actual size and expected size.
+- `copy_verify.sh` (+ `test_copy_verify.sh`, 23 checks): copies a folder tree keeping file
+  dates (rsync -a, or cp -Rp with `--use-cp`), then verifies every file by name, size and
+  modification date and prints IDENTICAL or the differences. `--verify-only` just compares.
+  Refuses `< >` placeholders, a missing source, and a destination inside the source.
+  Safe to re-run. Written after Finder failed on DWARF files with odd permissions.
+### Changed
+- The truncated-file list in the summary shows three path levels (`session/cam_0/name`).
 
 ## [0.9.0] - 2026-10-12
 ### Changed (default layout!)

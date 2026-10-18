@@ -3,9 +3,10 @@
 Use this when a version is final (for example, before migrating a season of data), so
 the exact tools can be reproduced later.
 
-1. **Tests pass:** `pytest -q`
+1. **Tests pass:** `pytest -q` and `sh test_copy_verify.sh`
 2. **Bump the version** in `fits_metadata_extractor.py` AND `fits_migrator.py`
-   (`__version__`). The tests fail if the two differ.
+   (`__version__`) AND `copy_verify.sh` (two places: the header comment and the
+   `echo` line; both read `fits tools x.y.z`). The tests fail if they differ.
    - New behaviour → bump MINOR (0.8.0 → 0.9.0)
    - Bug fix only   → bump PATCH (0.8.0 → 0.8.1)
    - 1.0.0 = all data migrated and Meridian verified

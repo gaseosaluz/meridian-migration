@@ -1340,6 +1340,14 @@ class TestVersioning:
             "CHANGELOG.md's newest entry must be the current version — "
             "update it when you bump __version__")
 
+    def test_copy_verify_script_matches_version(self):
+        p = HERE / 'copy_verify.sh'
+        if not p.exists():
+            pytest.skip('copy_verify.sh is not in this folder')
+        text = p.read_text()
+        assert text.count(f'fits tools {MIGRATOR_VERSION}') >= 2, (
+            'copy_verify.sh must say "fits tools <current version>" in its header and its echo line')
+
     def test_banner(self):
         assert version_banner() == f"fits_migrator {MIGRATOR_VERSION} (extractor {EXTRACTOR_VERSION})"
 
@@ -1574,3 +1582,62 @@ class TestReviewRootCli:
         r = self.run(tmp_path, '--review-root', str(tmp_path / 'Meridian' / 'Review'))
         assert r.returncode != 0 and 'must not be inside the output folder' in r.stderr
         assert not (tmp_path / 'Meridian').exists()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.9.1 — dry-run plan check, clearer review reasons, truncated path
+# ══════════════════════════════════════════════════════════════════════════════
+class TestDryRunPlanCheck:
+    def make_tree(self, tmp_path, n=25):
+        import numpy as np
+        from astropy.io import fits
+        d = tmp_path / '2026' / 'DWARF 3'
+        d.mkdir(parents=True)
+        for i in range(n):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 42'; h['EXPTIME'] = 60.0
+            h['DATE-OBS'] = f'2026-03-01T21:{i:02d}:00'; h['RA'] = 83.0; h['DEC'] = -5.0
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(d / f'good_{i}.fits')
+        return tmp_path / '2026'
+
+    def run(self, tmp_path, src, *extra):
+        return subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'), str(src),
+                               str(tmp_path / 'Meridian'), '--summary', *extra],
+                              capture_output=True, text=True, cwd=tmp_path,
+                              env={**__import__('os').environ, 'PYTHONPATH': str(HERE)})
+
+    def test_dry_run_prints_plan_check_before_and_after_copy(self, tmp_path):
+        src = self.make_tree(tmp_path)
+        r1 = self.run(tmp_path, src)
+        assert 'Plan check    : would copy 25, already present 0, skipped 0, missing sources 0' in r1.stdout
+        assert not (tmp_path / 'Meridian').exists()
+        assert self.run(tmp_path, src, '--execute').returncode == 0
+        r2 = self.run(tmp_path, src)
+        assert 'would copy 0, already present 25' in r2.stdout
+        assert 'not copied again' in r2.stdout
+
+    def test_execute_does_not_print_plan_check(self, tmp_path):
+        r = self.run(tmp_path, self.make_tree(tmp_path), '--execute')
+        assert 'Plan check' not in r.stdout and 'Done — copied: 25' in r.stdout
+
+
+class TestReviewReasonDetail:
+    def test_reason_states_failed_count(self):
+        ms = [lm('s', f'2025-07-11T22:{i % 60:02d}:00', exp=15.0, target='M 31', name=f'good_{i}.fits') for i in range(6)]
+        ms += [lm('s', f'2025-07-12T00:{i % 60:02d}:00', exp=15.0, target='M 31', name=f'failed_M 31_{i}.fits') for i in range(329)]
+        plan = plan_migration(ms, OUTPUT)
+        reason = plan[0].review_reason
+        assert 'only 1.5 min of exposure' in reason and '329 of 335 sub-frames failed or truncated' in reason
+
+    def test_no_failed_count_when_none_failed(self):
+        ms = [lm('s', '2026-03-01T22:00:00', exp=15.0, target='M 42') for _ in range(4)]
+        assert 'sub-frames' not in plan_migration(ms, OUTPUT)[0].review_reason
+
+
+class TestTruncatedListPath:
+    def test_summary_shows_three_path_levels(self, capsys):
+        a = lm('s1', None, ftype='FLAT', target='', name='flat_gain_2_bin_1_ir_0.fits')
+        a.file_path = '/src/2026/session_a/cam_0/flat_gain_2_bin_1_ir_0.fits'
+        a.truncated = True
+        print_summary(plan_migration([a], OUTPUT))
+        assert '2026/session_a/cam_0/flat_gain_2_bin_1_ir_0.fits'.replace('2026/', '') in capsys.readouterr().out
