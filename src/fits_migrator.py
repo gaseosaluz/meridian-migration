@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Version 0.9.0 - see CHANGELOG.md
+Version 0.9.1 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -93,7 +93,7 @@ from fits_metadata_extractor import (
 )
 
 # One shared project version (must equal the extractor's; see RELEASING.md)
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 try:
     from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
 except ImportError:                                  # extractor older than 0.8.0
@@ -426,8 +426,12 @@ def build_sessions(metas: list,
                            else 'no usable frames (failed or truncated)')
         if (exps and not is_solar_system_target(target)
                 and info.integration_s < min_session_minutes * 60):
-            reasons.append(f'only {info.integration_s / 60:.1f} min of exposure '
-                           f'(< {min_session_minutes:g} min)')
+            reason = (f'only {info.integration_s / 60:.1f} min of exposure '
+                      f'(< {min_session_minutes:g} min)')
+            n_bad = len(subs) - len(good)
+            if n_bad:
+                reason += f'; {n_bad} of {len(subs)} sub-frames failed or truncated'
+            reasons.append(reason)
         if reasons:
             info.review, info.review_reason = True, '; '.join(reasons)
         sessions[key] = info
@@ -833,7 +837,7 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
         print(f"  Truncated     : {len(truncated)} file(s) moved to _Review "
               f"(shorter than their headers say)")
         for a in truncated[:10]:
-            print(f"    ⚑ {a.source.parent.name}/{a.source.name}")
+            print(f"    ⚑ {'/'.join(a.source.parts[-3:])}")
         if len(truncated) > 10:
             print(f"    … and {len(truncated) - 10} more")
     print('=' * W)
@@ -1086,6 +1090,16 @@ Examples:
 
     # ── Execute ───────────────────────────────────────────────────────────────
     stats = execute_plan(plan, dry_run=dry_run, output_root=output_root)
+
+    if dry_run:
+        verb = 'move' if operation == 'move' else 'copy'
+        n_go = stats.get('moved', 0) if operation == 'move' else stats.get('copied', 0)
+        print(f"\n  Plan check    : would {verb} {n_go}, "
+              f"already present {stats.get('already_present', 0)}, "
+              f"skipped {stats['skipped']}, missing sources {stats['errors']}")
+        if stats.get('already_present'):
+            print("                  (files already in the output folder with the same size "
+                  "and date are not copied again)")
 
     if not dry_run:
         print(f"\n  Done — copied: {stats.get('copied', 0)}, "

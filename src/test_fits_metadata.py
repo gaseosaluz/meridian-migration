@@ -856,6 +856,15 @@ class TestTruncatedFiles:
         assert meta.is_valid and meta.truncated is True and meta.object_name == 'M 31'
         assert any('truncated' in w for w in meta.warnings)
 
+    def test_truncated_file_logged_with_path_and_sizes(self, tmp_path, caplog):
+        p = self.write(tmp_path)
+        full = p.stat().st_size
+        cut = self.write(tmp_path, 'light_M 31_cutdebug.fits', keep=full // 2)
+        with caplog.at_level(_logging.DEBUG, logger='fits_extractor'):
+            extract_metadata(cut)
+        msgs = [r.message for r in caplog.records if r.message.startswith('Truncated file:')]
+        assert msgs and str(cut) in msgs[0] and 'bytes; header says' in msgs[0]
+
     def test_scan_reports_truncated_files_once(self, tmp_path, caplog):
         from fits_metadata_extractor import scan_directory
         full = self.write(tmp_path).stat().st_size

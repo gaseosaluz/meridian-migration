@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Version 0.9.0 - see CHANGELOG.md
+Version 0.9.1 - see CHANGELOG.md
 Sprint 2, Phase 1 - Rev 8 (truncated-file detection); Rev 7 (one summary warning for implausible dates); Rev 6 (S30 Pro, implausible-date guard); Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # One shared project version for all files (bump together; see RELEASING.md).
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 def environment_line() -> str:
@@ -787,12 +787,15 @@ def extract_metadata(fits_path: Path) -> FITSMetadata:
             # copy.  Same test astropy uses, plus its own warning as a backstop.
             info = hdul[0].fileinfo() or {}
             expected = info.get('datLoc', 0) + info.get('datSpan', 0)
-            short = bool(expected) and fits_path.stat().st_size < expected
+            actual = fits_path.stat().st_size
+            short = bool(expected) and actual < expected
             warned = any('truncated' in str(w.message).lower() for w in caught)
             if short or warned:
                 meta.truncated = True
                 meta.warnings.append("File is truncated (shorter than its header says)")
                 _truncated_files.append(fits_path.name)
+                logger.debug(f"Truncated file: {fits_path} ({actual} bytes; "
+                             f"header says {expected})")
             for w in caught:                       # keep every other astropy warning visible
                 if 'truncated' not in str(w.message).lower():
                     warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
