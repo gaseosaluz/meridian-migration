@@ -1,6 +1,6 @@
 #!/bin/sh
 # copy_verify.sh — copy a folder tree, keep the file dates, then verify the copy.
-# Companion to the fits tools (0.9.1).  Works in sh, bash and zsh (macOS and Linux).
+# Companion to the fits tools 0.9.1.  Works in sh, bash and zsh (macOS and Linux).
 #
 # Usage:
 #   ./copy_verify.sh SOURCE_FOLDER DEST_FOLDER          copy, then verify
