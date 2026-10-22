@@ -225,6 +225,8 @@ surprises.log
 # ── Migrator run captures / dry-run artifacts ─────────────────────────────────
 fits_migrator_*.txt
 fits_metadata_*.txt
+run*.txt
+
 
 # ── Python cache ──────────────────────────────────────────────────────────────
 __pycache__/
