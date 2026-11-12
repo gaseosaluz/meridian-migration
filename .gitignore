@@ -226,6 +226,7 @@ surprises.log
 fits_migrator_*.txt
 fits_metadata_*.txt
 run*.txt
+dry*.txt
 
 
 # ── Python cache ──────────────────────────────────────────────────────────────
