@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Version 0.9.1 - see CHANGELOG.md
+Version 0.10.0 - see CHANGELOG.md
 Sprint 2, Phase 1 - Rev 8 (truncated-file detection); Rev 7 (one summary warning for implausible dates); Rev 6 (S30 Pro, implausible-date guard); Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # One shared project version for all files (bump together; see RELEASING.md).
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 
 
 def environment_line() -> str:
@@ -134,6 +134,7 @@ FRAME_FILENAME_PREFIXES: dict = {
     'raw_':     'DARK',     # DWARF individual dark sub-frames
     'light_':   'LIGHT',    # Seestar light sub-frames
     # Rev 3 additions — no WARNING produced; classified silently
+    'masterdark_': 'DARK',  # Seestar S30 Pro master dark, e.g. MasterDark_5_30.0s_20.3C_20261116-200246.fit
     'unknown_': 'UNKNOWN',  # Device-internal unclassified frames
     'failed_':  'UNKNOWN',  # Capture-failure frames recorded by device
     'stacked-': 'LIGHT',    # DWARF device-stacked output, e.g. stacked-16_…
@@ -152,6 +153,10 @@ _RE_DARK_STACK = re.compile(
 # raw_10s_60_0000_20260102-184951912_35C.fits  (individual dark subs)
 _RE_DARK_RAW = re.compile(
     r'raw_([\d.]+)s_(\d+)_\d+_[\d-]+_(-?\d+)C', re.IGNORECASE)
+
+# MasterDark_5_30.0s_20.3C_20261116-200246.fit  (Seestar S30 Pro: 5 frames, 30 s, 20.3 C)
+_RE_MASTER_DARK = re.compile(
+    r'masterdark_(\d+)_([\d.]+)s_(-?[\d.]+)C(?:_|$)', re.IGNORECASE)
 
 # bias_gain_2_bin_1.fits
 _RE_BIAS = re.compile(r'bias_gain_(\d+)_bin_\d+', re.IGNORECASE)
@@ -285,6 +290,7 @@ def parse_calibration_filename(filename: str) -> dict:
       raw_10s_60_0000_20260102-184951912_35C.fits         → exp=10, gain=60, temp=35
       bias_gain_2_bin_1.fits                              → gain=2
       flat_gain_2_bin_1_ir_0.fits                         → gain=2
+      MasterDark_5_30.0s_20.3C_20261116-200246.fit        → exp=30, temp=20.3 (Seestar S30 Pro)
 
     Returns a (possibly partial) dict with keys: exposure_time, gain, temperature.
     Empty dict if no pattern matched.
@@ -303,6 +309,12 @@ def parse_calibration_filename(filename: str) -> dict:
     if m:
         result['exposure_time'] = float(m.group(1))
         result['gain']          = int(m.group(2))
+        result['temperature']   = float(m.group(3))
+        return result
+
+    m = _RE_MASTER_DARK.search(stem)
+    if m:
+        result['exposure_time'] = float(m.group(2))
         result['temperature']   = float(m.group(3))
         return result
 
@@ -604,6 +616,8 @@ _KNOWN_HEADERS: frozenset = frozenset({
     'WIDECAM',
     # Seestar S30 Pro headers (Rev 6)
     'BIAS', 'DATE-EXP',
+    # Seen on S30 Pro stacks after a firmware update (2026-11); meaning not documented
+    'OB_CU',
     # Frame classification
     'IMAGETYP',
     # Site / location

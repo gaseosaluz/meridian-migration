@@ -875,3 +875,48 @@ class TestTruncatedFiles:
         msgs = [r.message for r in caplog.records if 'truncated file(s) found' in r.message]
         assert len(msgs) == 1 and msgs[0].startswith('3 truncated')
         assert sum(r.truncated for r in results) == 3
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.10.0 — Seestar S30 Pro firmware update: MasterDark files, OB_CU header
+# ══════════════════════════════════════════════════════════════════════════════
+class TestMasterDark:
+    NAME = 'MasterDark_5_30.0s_20.3C_20261116-200246.fit'
+
+    @pytest.mark.parametrize('name', [
+        'MasterDark_5_30.0s_20.3C_20261116-200246.fit',
+        'MasterDark_5_30.0s_21.7C_20261112-213300.fit',
+        'MasterDark_5_30.0s_23.6C_20261104-192040.fit',
+        'masterdark_5_30.0s_20.3C_20261116-200246.fit',
+        'MASTERDARK_12_10.0s_18.0C_20261116-200246.FIT',
+    ])
+    def test_classified_as_dark(self, name):
+        assert classify_from_filename(name) == 'DARK'
+
+    def test_exposure_and_temperature_from_filename(self):
+        assert parse_calibration_filename(self.NAME) == {'exposure_time': 30.0, 'temperature': 20.3}
+
+    def test_negative_and_whole_number_temperature(self):
+        assert parse_calibration_filename('MasterDark_3_10.0s_-5.2C_20261116-200246.fit')['temperature'] == -5.2
+        assert parse_calibration_filename('MasterDark_3_10s_21C_20261116-200246.fit') == {'exposure_time': 10.0, 'temperature': 21.0}
+
+    def test_lights_and_stacks_not_mistaken_for_master_dark(self):
+        assert parse_calibration_filename('Light_M 31_30.0s_IRCUT_20261105-031001.fit') == {}
+        assert classify_from_filename('Stacked_758_M 31_30.0s_IRCUT_20261105-031001.fit') == 'LIGHT'
+
+    def test_ob_cu_is_a_known_header(self):
+        assert _is_known_header('OB_CU') and _is_known_header('ob_cu')
+
+    def test_full_extraction_of_a_master_dark_without_imagetyp(self, tmp_path, caplog):
+        import numpy as np
+        h = fits.Header()
+        h['TELESCOP'] = 'S30 Pro_da267bef'; h['CREATOR'] = 'ZWO Seestar S30 Pro'
+        p = tmp_path / self.NAME
+        fits.PrimaryHDU(np.zeros((8, 4), dtype='uint16'), header=h).writeto(p)
+        with caplog.at_level(_logging.WARNING, logger='fits_extractor'):
+            meta = extract_metadata(p)
+        assert meta.frame_type == 'DARK' and meta.device_type == 'SEESTAR_S30_PRO'
+        assert meta.exposure_time == 30.0 and meta.temperature == 20.3
+        assert not [r for r in caplog.records if 'Cannot classify' in r.message]
+        assert meta.is_valid

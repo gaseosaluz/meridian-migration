@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Version 0.9.1 - see CHANGELOG.md
+Version 0.10.0 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -93,7 +93,7 @@ from fits_metadata_extractor import (
 )
 
 # One shared project version (must equal the extractor's; see RELEASING.md)
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 try:
     from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
 except ImportError:                                  # extractor older than 0.8.0
@@ -145,6 +145,22 @@ def version_mismatch() -> Optional[str]:
         return (f"Version mismatch: fits_migrator is {__version__} but "
                 f"fits_metadata_extractor is {EXTRACTOR_VERSION}. Download all "
                 f"files from the same release.")
+    return None
+
+
+def missing_parent_problem(output_root: Path, review_root: Optional[Path]) -> Optional[str]:
+    """Text describing a mistyped destination, or None.
+
+    A real destination's parent folder exists (the drive is mounted, the Astronomy
+    folder is there).  A missing parent usually means a typo such as 'mes/HD4/...'
+    for '/Volumes/HD4/...', which would silently create a stray folder tree in
+    the current directory."""
+    for label, p in (('output', output_root), ('review', review_root)):
+        if p is None:
+            continue
+        parent = Path(p).expanduser().absolute().parent
+        if not parent.exists():
+            return f"the parent of the {label} folder does not exist: {parent}"
     return None
 
 
@@ -231,6 +247,10 @@ def _year_folder(meta: FITSMetadata) -> str:
     for part in Path(meta.file_path).parts:
         if re.fullmatch(r'20\d{2}', part):
             return part
+    # Then the capture time in the file name (e.g. MasterDark_…_20261116-200246.fit)
+    fn_time = parse_filename_time(meta.file_name)
+    if fn_time is not None and is_plausible_year(fn_time.year):
+        return str(fn_time.year)
     return FOLDER_UNKNOWN_YEAR
 
 
@@ -993,6 +1013,9 @@ Examples:
                         help='Where review material goes (failed / truncated frames, '
                              'aborted and Unknown sessions). Default: a folder next to '
                              'the output folder, named <output>_Review. Do not watch it in Meridian.')
+    parser.add_argument('--create-parents', action='store_true',
+                        help='Allow --execute when the output folder\'s parent does not exist '
+                             '(normally a sign of a mistyped path)')
     parser.add_argument('--review-in-tree', action='store_true',
                         help='Put _Review folders inside the output tree (Meridian will '
                              'count those frames in its totals)')
@@ -1041,6 +1064,14 @@ Examples:
         except ValueError:
             pass
 
+    parent_problem = missing_parent_problem(output_root, review_root)
+    if parent_problem and not dry_run and not args.create_parents:
+        print(f"  ✗  {parent_problem}", file=sys.stderr)
+        print("     Check the output path for a typo. Nothing was written. "
+              "If you really want a new folder tree, add --create-parents.",
+              file=sys.stderr)
+        sys.exit(2)
+
     log_path = attach_run_log(dry_run)
     if mismatch:
         logger.warning(mismatch)
@@ -1055,6 +1086,11 @@ Examples:
     if args.device: print(f"  Device    : {args.device}")
     if args.target: print(f"  Target(s) : {', '.join(args.target)}")
     print(f"  Nights    : {'MERGED (old layout)' if args.merge_nights else 'SPLIT per night, tz ' + args.tz}")
+    if parent_problem:
+        print(f"  ⚠  {parent_problem}")
+        print("     This looks like a typo in the output path. A real run (--execute) "
+              "would refuse to start.")
+        logger.warning(parent_problem)
 
     # ── Scan ──────────────────────────────────────────────────────────────────
     print(f"\n  Scanning {source_root} …")

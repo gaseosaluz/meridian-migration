@@ -4,6 +4,18 @@ One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.p
 `session_report.py`, `copy_verify.sh`). Versions bump together; see `RELEASING.md`.
 Dates were not recorded for 0.1.0 – 0.7.0.
 
+## [0.10.0] - 2026-11-25
+### Added
+- Seestar S30 Pro `MasterDark_<n>_<exp>s_<temp>C_<time>.fit` files (new after a firmware update)
+  are recognised as dark frames; exposure and temperature are read from the file name and they
+  go to `_Calibration/Dark/`. Before, they were "Cannot classify" and went to review.
+- The year of a file with no header date and no year in its path is taken from the capture time
+  in its file name (implausible years are still ignored).
+- `OB_CU` (appears on S30 Pro stacks after the update; meaning unknown) is a known header.
+- A mistyped output path is caught: if the parent of the output (or review) folder does not exist
+  (e.g. `mes/HD4/...` instead of `/Volumes/HD4/...`), a dry run warns and `--execute` refuses to
+  start. `--create-parents` overrides it.
+
 ## [0.9.1] - 2026-10-13
 ### Added
 - A dry run now prints a `Plan check` line (would copy / already present / skipped / missing

@@ -61,6 +61,9 @@ from fits_migrator import (
     version_mismatch,
     attach_run_log,
     default_review_root,
+    _year_folder,
+    FOLDER_UNKNOWN_YEAR,
+    missing_parent_problem,
 )
 
 
@@ -1641,3 +1644,104 @@ class TestTruncatedListPath:
         a.truncated = True
         print_summary(plan_migration([a], OUTPUT))
         assert '2026/session_a/cam_0/flat_gain_2_bin_1_ir_0.fits'.replace('2026/', '') in capsys.readouterr().out
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.10.0 — MasterDark files, year from file name, mistyped output path
+# ══════════════════════════════════════════════════════════════════════════════
+def master_dark(name='MasterDark_5_30.0s_20.3C_20261116-200246.fit', path='/Volumes/HD4/Astro_new_s30'):
+    return make_meta(file_path=f'{path}/{name}', file_name=name, frame_type='DARK',
+                     device_type='SEESTAR_S30_PRO', object_name='', observation_year=None,
+                     exposure_time=30.0, temperature=20.3)
+
+
+class TestMasterDarkRouting:
+    def test_year_from_file_name_when_header_and_path_have_none(self):
+        assert _year_folder(master_dark()) == '2026'
+
+    def test_path_year_still_wins_over_file_name(self):
+        assert _year_folder(master_dark(path='/data/2025/s30')) == '2025'
+
+    def test_header_year_still_wins(self):
+        m_ = master_dark(); m_.observation_year = 2026
+        assert _year_folder(m_) == '2026'
+
+    def test_implausible_file_name_year_is_ignored(self):
+        m_ = master_dark(name='MasterDark_5_30.0s_20.3C_20381116-200246.fit')
+        assert _year_folder(m_) == FOLDER_UNKNOWN_YEAR
+
+    def test_no_time_anywhere_is_unknown_year(self):
+        assert _year_folder(make_meta(file_path='/x/dark_exp_10_gain_60_bin_1_33C_stack_3.fits',
+                                      file_name='dark_exp_10_gain_60_bin_1_33C_stack_3.fits',
+                                      observation_year=None)) == FOLDER_UNKNOWN_YEAR
+
+    def test_master_darks_go_to_shared_calibration(self):
+        names = ['MasterDark_5_30.0s_20.3C_20261116-200246.fit',
+                 'MasterDark_5_30.0s_21.7C_20261112-213300.fit',
+                 'MasterDark_5_30.0s_23.6C_20261104-192040.fit']
+        plan = plan_migration([master_dark(n) for n in names], OUTPUT, review_root=REVIEW)
+        assert all(a.dest.parts[-4:-1] == ('2026', '_Calibration', 'Dark') for a in plan)
+        assert not any(in_review(a) for a in plan)
+        assert {a.source.name for a in plan} == set(names)
+
+    def test_summary_has_no_unknown_frames_or_year(self, capsys):
+        print_summary(plan_migration([master_dark()], OUTPUT, review_root=REVIEW))
+        out = capsys.readouterr().out
+        assert 'UNKNOWN' not in out and '_UnknownYear' not in out and "'DARK': 1" in out
+
+
+class TestMissingParentProblem:
+    def test_existing_parent_is_fine(self, tmp_path):
+        assert missing_parent_problem(tmp_path / 'Meridian', tmp_path / 'Meridian_Review') is None
+
+    def test_missing_parent_reported_with_absolute_path(self, tmp_path):
+        msg = missing_parent_problem(tmp_path / 'mes' / 'HD4' / 'Meridian', None)
+        assert msg and 'output folder does not exist' in msg and str(tmp_path / 'mes' / 'HD4') in msg
+
+    def test_review_parent_checked_too(self, tmp_path):
+        msg = missing_parent_problem(tmp_path / 'Meridian', tmp_path / 'nodir' / 'Review')
+        assert msg and 'review folder' in msg
+
+    def test_review_in_tree_none_is_ignored(self, tmp_path):
+        assert missing_parent_problem(tmp_path / 'Meridian', None) is None
+
+
+class TestMistypedOutputCli:
+    def tree(self, tmp_path):
+        import numpy as np
+        from astropy.io import fits
+        d = tmp_path / 'src'; d.mkdir()
+        for i in range(12):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 42'; h['EXPTIME'] = 60.0
+            h['DATE-OBS'] = f'2026-03-01T21:{i:02d}:00'; h['RA'] = 83.0; h['DEC'] = -5.0
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(d / f'f{i}.fits')
+        return d
+
+    def run(self, tmp_path, out, *extra):
+        return subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'), str(self.tree(tmp_path)),
+                               str(out), '--summary', *extra], capture_output=True, text=True, cwd=tmp_path,
+                              env={**__import__('os').environ, 'PYTHONPATH': str(HERE)})
+
+    def test_dry_run_warns_but_continues(self, tmp_path):
+        r = self.run(tmp_path, 'mes/HD4/Astronomy/Meridian')
+        assert r.returncode == 0
+        assert 'does not exist' in r.stdout and 'looks like a typo' in r.stdout
+        assert 'Plan check' in r.stdout
+        assert not (tmp_path / 'mes').exists()
+
+    def test_execute_refuses_and_writes_nothing(self, tmp_path):
+        r = self.run(tmp_path, 'mes/HD4/Astronomy/Meridian', '--execute')
+        assert r.returncode == 2
+        assert 'does not exist' in r.stderr and '--create-parents' in r.stderr
+        assert not (tmp_path / 'mes').exists()
+        assert not list(tmp_path.glob('migration_*.log'))
+
+    def test_create_parents_allows_it(self, tmp_path):
+        r = self.run(tmp_path, tmp_path / 'new' / 'place' / 'Meridian', '--execute', '--create-parents')
+        assert r.returncode == 0, r.stderr
+        assert len(list((tmp_path / 'new' / 'place' / 'Meridian').rglob('*.fits'))) == 12
+
+    def test_normal_output_has_no_warning(self, tmp_path):
+        r = self.run(tmp_path, tmp_path / 'Meridian', '--execute')
+        assert r.returncode == 0 and 'does not exist' not in r.stdout
