@@ -148,15 +148,23 @@ activemq-data/
 *.sage.py
 
 # Environments
+# ── Editors, environments, backups ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
 .env
-.envrc
 .venv
-env/
-venv/
+.envrc
+.env/
+.venv/
 ENV/
 env.bak/
 venv.bak/
 
+   
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -220,16 +228,32 @@ __marimo__/
 # FITS Migrator 
 # ── Runtime logs (regenerated on every scan) ──────────────────────────────────
 surprises.log
+migration.log
+migration_*.log
+copy_verify_*.log
+*.log
 *.log
 
 # ── Migrator run captures / dry-run artifacts ─────────────────────────────────
-fits_migrator_*.txt
-fits_metadata_*.txt
-run*.txt
+# Dry-run / run captures you redirect to files (dry.txt, run_dwarf.txt, fits_migrator_*.txt ...)
 dry*.txt
+run*.txt
+fits_migrator_*.txt
+fits-migrator-*.txt
+fits_metadata_*.txt
+all_sessions.txt
+m16report.txt
+m31report.txt
+d
+# ── Pythone ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
 
-
-# ── Python cache ──────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -255,3 +279,11 @@ htmlcov/
 .env
 .venv/
 
+# ── Never commit data ─────────────────────────────────────────────────────────
+*.fit
+*.fits
+*.FIT
+*.FITS
+Meridian/
+Meridian_Review/
+Meridian_Test*/
