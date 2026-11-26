@@ -64,6 +64,11 @@ from fits_migrator import (
     _year_folder,
     FOLDER_UNKNOWN_YEAR,
     missing_parent_problem,
+    _same_file,
+    _same_content,
+    date_offset_summary,
+    _DATE_OFFSETS,
+    _CONTENT_CACHE,
 )
 
 
@@ -1745,3 +1750,282 @@ class TestMistypedOutputCli:
     def test_normal_output_has_no_warning(self, tmp_path):
         r = self.run(tmp_path, tmp_path / 'Meridian', '--execute')
         assert r.returncode == 0 and 'does not exist' not in r.stdout
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.11.0 — --default-year for files that have no date anywhere
+# ══════════════════════════════════════════════════════════════════════════════
+def undated_dark(i=0, ftype='DARK'):
+    name = f'dark_exp_10.000000_gain_60_bin_1_33C_stack_{i}.fits'
+    return make_meta(file_path=f'/Volumes/HD4/Astro_new_DWARF/dark/{name}', file_name=name,
+                     frame_type=ftype, object_name='', observation_year=None)
+
+
+class TestDefaultYear:
+    def test_without_option_goes_to_unknown_year(self):
+        plan = plan_migration([undated_dark()], OUTPUT)
+        assert plan[0].year == FOLDER_UNKNOWN_YEAR and FOLDER_UNKNOWN_YEAR in plan[0].dest.parts
+
+    def test_option_gives_those_files_a_year(self):
+        plan = plan_migration([undated_dark(i) for i in range(3)], OUTPUT, default_year='2026')
+        assert all(a.dest.parts[-4:-1] == ('2026', '_Calibration', 'Dark') for a in plan)
+        assert {a.year for a in plan} == {'2026'}
+
+    def test_files_that_have_a_year_keep_it(self):
+        has_header = make_meta(file_name='dark_a.fits', frame_type='DARK', object_name='', observation_year=2025)
+        has_path = make_meta(file_path='/data/2024/dark_b.fits', file_name='dark_b.fits', frame_type='DARK',
+                             object_name='', observation_year=None)
+        plan = plan_migration([has_header, has_path, undated_dark()], OUTPUT, default_year='2026')
+        assert [a.year for a in plan] == ['2025', '2024', '2026']
+
+    def test_callers_metadata_is_not_modified(self):
+        meta = undated_dark()
+        plan_migration([meta], OUTPUT, default_year='2026')
+        assert meta.observation_year is None
+
+    def test_year_filter_sees_the_default_year(self):
+        plan = plan_migration([undated_dark()], OUTPUT, default_year='2026', year_filter='2026')
+        assert len(plan) == 1
+        assert plan_migration([undated_dark()], OUTPUT, default_year='2026', year_filter='2025') == []
+
+    def test_undated_lights_use_it_too(self):
+        ms = [lm('n', None, name=f'x{i}.fits') for i in range(30)]
+        for m_ in ms:
+            m_.observation_year = None
+            m_.file_path = f'/Volumes/HD4/new/{m_.file_name}'
+        plan = plan_migration(ms, OUTPUT, default_year='2026')
+        assert {a.dest.parts[-5] for a in plan} == {'2026'}
+        assert {a.dest.parent.name for a in plan} == {FOLDER_UNKNOWN_DATE}
+
+    def test_summary_flags_unknown_year_and_names_the_option(self, capsys):
+        print_summary(plan_migration([undated_dark(i) for i in range(4)], OUTPUT))
+        out = capsys.readouterr().out
+        assert '4 file(s) have no date anywhere' in out and '--default-year YYYY' in out
+
+    def test_summary_silent_when_every_file_has_a_year(self, capsys):
+        print_summary(plan_migration([undated_dark()], OUTPUT, default_year='2026'))
+        assert 'No year' not in capsys.readouterr().out
+
+
+class TestDefaultYearCli:
+    def tree(self, tmp_path):
+        import numpy as np
+        from astropy.io import fits
+        d = tmp_path / 'new_dwarf' / 'dark'
+        d.mkdir(parents=True)
+        for i in range(3):
+            fits.PrimaryHDU(np.zeros((2180, 3856), dtype='uint8')).writeto(d / f'dark_exp_10.000000_gain_60_bin_1_3{i}C_stack_3.fits')
+        return tmp_path / 'new_dwarf'
+
+    def run(self, tmp_path, *extra):
+        return subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'), str(self.tree(tmp_path)),
+                               str(tmp_path / 'Meridian'), '--summary', *extra], capture_output=True, text=True,
+                              cwd=tmp_path, env={**__import__('os').environ, 'PYTHONPATH': str(HERE)})
+
+    def test_dry_run_without_option_warns_about_years_only(self, tmp_path):
+        r = self.run(tmp_path)
+        assert r.returncode == 0
+        assert 'No year' in r.stdout and '3 file(s) with stripped headers' in r.stdout
+        assert 'possible firmware rename' not in r.stdout
+        assert 'Years         : {\'_UnknownYear\': 3}' in r.stdout
+
+    def test_execute_with_option(self, tmp_path):
+        r = self.run(tmp_path, '--execute', '--default-year', '2026')
+        assert r.returncode == 0, r.stderr
+        assert 'Def. year : 2026' in r.stdout and 'No year' not in r.stdout
+        assert len(list((tmp_path / 'Meridian' / '2026' / '_Calibration' / 'Dark').glob('*.fits'))) == 3
+        assert not (tmp_path / 'Meridian' / FOLDER_UNKNOWN_YEAR).exists()
+
+    @pytest.mark.parametrize('bad', ['26', 'abcd', '2038', '1999', '20260'])
+    def test_bad_year_is_refused(self, tmp_path, bad):
+        r = self.run(tmp_path, '--default-year', bad)
+        assert r.returncode == 2 and '--default-year' in r.stderr
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.12.0 — same name and size, different date: compare the contents
+# (a fresh download shifted every date by exactly one hour; the old check said "different")
+# ══════════════════════════════════════════════════════════════════════════════
+import fits_migrator as _fm2
+
+
+def pair(tmp_path, content_a=b'A' * 200, content_b=b'A' * 200, shift=3600, name='C 11_15s60_20261005-203709932_34C.fits'):
+    """A source file and an existing destination file, dates `shift` seconds apart."""
+    s = tmp_path / 'src' / name
+    d = tmp_path / 'dst' / name
+    s.parent.mkdir(parents=True, exist_ok=True); d.parent.mkdir(parents=True, exist_ok=True)
+    s.write_bytes(content_a); d.write_bytes(content_b)
+    os.utime(d, (1_790_000_000, 1_790_000_000))
+    os.utime(s, (1_790_000_000 + shift, 1_790_000_000 + shift))
+    return s, d
+
+
+@pytest.fixture(autouse=True)
+def _clear_content_state():
+    _DATE_OFFSETS.clear(); _CONTENT_CACHE.clear(); _fm2._content_compares[0] = 0
+    yield
+
+
+class TestContentComparison:
+    def test_same_content_one_hour_apart_is_present(self, tmp_path):
+        s, d = pair(tmp_path)
+        assert _same_file(s, d) is True
+        assert _DATE_OFFSETS[(str(s), str(d))] == -3600
+
+    @pytest.mark.parametrize('shift', [3600, -3600, 7200, 5, -5, 86400])
+    def test_any_date_offset_with_same_content(self, tmp_path, shift):
+        s, d = pair(tmp_path, shift=shift)
+        assert _same_file(s, d) is True
+
+    def test_same_size_different_content_and_date_is_not_present(self, tmp_path):
+        s, d = pair(tmp_path, content_a=b'A' * 200, content_b=b'A' * 199 + b'B')
+        assert _same_file(s, d) is False and not _DATE_OFFSETS
+
+    def test_different_size_never_reads_content(self, tmp_path, monkeypatch):
+        s, d = pair(tmp_path, content_a=b'A' * 200, content_b=b'A' * 201)
+        monkeypatch.setattr(_fm2, '_same_content', lambda *a, **k: (_ for _ in ()).throw(AssertionError('read')))
+        assert _same_file(s, d) is False
+
+    def test_dates_within_two_seconds_never_read_content(self, tmp_path, monkeypatch):
+        s, d = pair(tmp_path, shift=2)
+        monkeypatch.setattr(_fm2, '_same_content', lambda *a, **k: (_ for _ in ()).throw(AssertionError('read')))
+        assert _same_file(s, d) is True and not _DATE_OFFSETS
+
+    def test_missing_files_are_not_the_same(self, tmp_path):
+        assert _same_file(tmp_path / 'nope', tmp_path / 'nada') is False
+
+    def test_each_pair_is_compared_only_once(self, tmp_path, monkeypatch):
+        s, d = pair(tmp_path)
+        calls = []
+        real = _fm2._same_content
+        monkeypatch.setattr(_fm2, '_same_content', lambda a, b, *x, **k: (calls.append(1), real(a, b))[1])
+        for _ in range(3):
+            assert _same_file(s, d)
+        assert len(calls) == 1
+
+    def test_content_compare_large_file_in_chunks(self, tmp_path):
+        a, b = tmp_path / 'a', tmp_path / 'b'
+        data = os.urandom(9 * 1024 * 1024)
+        a.write_bytes(data); b.write_bytes(data)
+        assert _same_content(a, b, chunk=1024 * 1024) is True
+        b.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+        assert _same_content(a, b, chunk=1024 * 1024) is False
+
+    def test_offset_summary_text(self):
+        _DATE_OFFSETS.update({('a', 'b'): -3600, ('c', 'd'): -3600, ('e', 'f'): 7200})
+        assert date_offset_summary() == '-3600 s × 2, +7200 s × 1'
+
+
+def lights_with_shifted_copies(tmp_path, n=6, shift=3600):
+    """n light frames already copied into out/ (dates original) and now downloaded again with dates +shift."""
+    src = tmp_path / 'Astro_new_DWARF' / 'session'
+    src.mkdir(parents=True)
+    ms = []
+    for i in range(n):
+        f = src / f'C 11_15s60_Duo-Band_2026100520{i:02d}00000_34C.fits'
+        f.write_bytes(bytes([i]) * 300)
+        os.utime(f, (1_790_000_000 + i * 15 + shift,) * 2)
+        ms.append(make_meta(file_path=str(f), file_name=f.name, object_name='C 11',
+                            observation_date=f'2026-10-05T20:{i:02d}:00', exposure_time=15.0,
+                            observation_year=2026))
+    out = tmp_path / 'Meridian'
+    plan = plan_migration(ms, out, min_session_minutes=0)
+    for a, m_ in zip(plan, ms):                      # the earlier copy: same bytes, ORIGINAL dates
+        a.dest.parent.mkdir(parents=True, exist_ok=True)
+        a.dest.write_bytes(Path(m_.file_path).read_bytes())
+        os.utime(a.dest, (Path(m_.file_path).stat().st_mtime - shift,) * 2)
+    return ms, out
+
+
+class TestShiftedDownloadEndToEnd:
+    def test_dry_run_counts_them_as_present(self, tmp_path):
+        ms, out = lights_with_shifted_copies(tmp_path)
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        s = execute_plan(plan, dry_run=True)
+        assert s['already_present'] == 6 and s['copied'] == 0 and s['present_by_content'] == 6
+
+    def test_execute_copies_nothing_and_makes_no_duplicates(self, tmp_path):
+        ms, out = lights_with_shifted_copies(tmp_path)
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['copied'] == 0 and s['already_present'] == 6 and s['present_by_content'] == 6
+        assert not list(out.rglob('*_2.fits'))
+        assert len(list(out.rglob('*.fits'))) == 6
+
+    def test_changed_frame_is_copied_as_new_file_not_skipped(self, tmp_path):
+        ms, out = lights_with_shifted_copies(tmp_path)
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        plan[2].dest.write_bytes(b'\x07' * 300)                       # same size, different bytes
+        os.utime(plan[2].dest, (1_790_000_000,) * 2)
+        s = execute_plan(plan, dry_run=False, output_root=out)
+        assert s['copied'] == 1 and s['already_present'] == 5
+        assert len(list(out.rglob('*_2.fits'))) == 1
+
+    def test_free_space_does_not_count_content_matches(self, tmp_path, monkeypatch):
+        from collections import namedtuple
+        U = namedtuple('U', 'total used free')
+        ms, out = lights_with_shifted_copies(tmp_path)
+        plan = plan_migration(ms, out, min_session_minutes=0)
+        monkeypatch.setattr(shutil, 'disk_usage', lambda p: U(0, 0, 10_000))
+        assert check_free_space(plan, out) == (True, 0, 10_000)
+
+    def test_summary_line_names_the_offset(self, tmp_path):
+        import numpy as np
+        from astropy.io import fits
+        src = tmp_path / 'new' / 'session'
+        src.mkdir(parents=True)
+        for i in range(4):
+            h = fits.Header(); h['TELESCOP'] = 'DWARF 3'; h['OBJECT'] = 'M 42'; h['EXPTIME'] = 60.0
+            h['DATE-OBS'] = f'2026-03-01T21:{i:02d}:00'; h['RA'] = 83.0; h['DEC'] = -5.0
+            fits.PrimaryHDU(np.zeros((4, 4), dtype='uint16'), header=h).writeto(src / f'f{i}.fits')
+        run = lambda *x: subprocess.run([_sys.executable, str(HERE / 'fits_migrator.py'), str(tmp_path / 'new'),
+                                         str(tmp_path / 'Meridian'), '--summary', *x], capture_output=True, text=True,
+                                        cwd=tmp_path, env={**os.environ, 'PYTHONPATH': str(HERE)})
+        assert run('--execute').returncode == 0
+        for f in src.glob('*.fits'):                                   # a "new download": dates shifted an hour
+            os.utime(f, (f.stat().st_mtime + 3600,) * 2)
+        r = run()
+        assert 'would copy 0, already present 4' in r.stdout
+        assert 'Dates differ  : 4 of those have identical content' in r.stdout and '3600 s × 4' in r.stdout.replace('+', '')
+        assert 'comparing their contents' in r.stdout
+        r2 = run('--execute')
+        assert 'copied: 0, already present: 4' in r2.stdout and 'Dates differ  : 4 already-present' in r2.stdout
+        assert not list((tmp_path / 'Meridian').rglob('*_2.fits'))
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.13.0 — untargeted captures go to the review folder, and the summary says where from
+# ══════════════════════════════════════════════════════════════════════════════
+def untargeted(i, folder='DWARF_RAW_TELE_EXP_0.0333333_GAIN_130_2026-10-21-19-19-51-153', name=None):
+    name = name or f'0.0333333s130_VIS_20261021-1921{i:02d}361_24C.fits'
+    return make_meta(file_path=f'/Volumes/HD4/new/DWARF III/{folder}/{name}', file_name=name,
+                     frame_type='UNKNOWN', object_name='', observation_year=2026, device_type='DWARF_3',
+                     observation_date='2026-10-21T19:21:15', exposure_time=0.0333)
+
+
+class TestUntargetedRouting:
+    def test_go_to_the_review_folder_not_to_the_dark_library(self):
+        plan = plan_migration([untargeted(i) for i in range(5)], OUTPUT, review_root=REVIEW)
+        assert all(in_review(a) for a in plan)
+        assert not any('_Calibration' in a.dest.parts or 'Dark' in a.dest.parts for a in plan)
+        assert all(a.dest.parts[-4:-1] == ('Meridian_Review', '2026', '_NoTarget') or a.dest.parts[-3:-1] == ('2026', '_NoTarget')
+                   for a in plan)
+
+    def test_summary_lists_the_folders_with_counts(self, capsys):
+        ms = [untargeted(i) for i in range(5)] + [untargeted(60, folder='other_folder')]
+        print_summary(plan_migration(ms, OUTPUT, review_root=REVIEW))
+        out = capsys.readouterr().out
+        assert 'Unclassified  : 6 file(s) moved to _Review' in out
+        assert '5  DWARF_RAW_TELE_EXP_0.0333333_GAIN_130_2026-10-21-19-19-51-153' in out and '1  other_folder' in out
+
+    def test_summary_silent_without_unclassified_files(self, capsys):
+        print_summary(plan_migration([lm('n', '2026-03-01T22:00:00', exp=60.0) for _ in range(12)], OUTPUT, review_root=REVIEW))
+        assert 'Unclassified' not in capsys.readouterr().out
+
+    def test_summary_caps_the_folder_list(self, capsys):
+        ms = [untargeted(i, folder=f'folder_{i}') for i in range(8)]
+        print_summary(plan_migration(ms, OUTPUT, review_root=REVIEW))
+        assert '… and 3 more folder(s)' in capsys.readouterr().out

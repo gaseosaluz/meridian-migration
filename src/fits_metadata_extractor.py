@@ -6,7 +6,7 @@ Astrophotography FITS Metadata Extractor
 Phase 1: Header Reading, Device Detection, Frame Classification
 
 Built for Ed's Astrophotography Migration Project
-Version 0.10.0 - see CHANGELOG.md
+Version 0.13.0 - see CHANGELOG.md
 Sprint 2, Phase 1 - Rev 8 (truncated-file detection); Rev 7 (one summary warning for implausible dates); Rev 6 (S30 Pro, implausible-date guard); Rev 5: adds WIDECAM to known headers (Rev 4: stacked_ prefix, IMAGEW/H, dup-handler guard)
 
 Validated against actual files from:
@@ -59,7 +59,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # One shared project version for all files (bump together; see RELEASING.md).
-__version__ = "0.10.0"
+__version__ = "0.13.0"
 
 
 def environment_line() -> str:
@@ -425,6 +425,13 @@ def detect_device(header: fits.Header,
     }
     if (naxis1, naxis2) in dim_map:
         device = dim_map[(naxis1, naxis2)]
+        if not (telescop or instrument or creator):
+            # Calibration frames are written with stripped headers, so an empty
+            # TELESCOP / INSTRUMENT / CREATOR is expected here, not a firmware rename.
+            _size_identified.append(f"{naxis1}×{naxis2} → {device}")
+            logger.debug(f"[size-detect] {file_path.name if file_path else '?'} → {device} "
+                         f"(stripped header, identified by image size {naxis1}×{naxis2})")
+            return device, warnings, 'dimensions'
         msg = (f"Device identified by image size ({naxis1}×{naxis2}) as {device}. "
                f"TELESCOP='{telescop}' not in known signatures — "
                f"possible firmware rename. Update DEVICE_SIGNATURES['TELESCOPE'].")
@@ -453,7 +460,8 @@ def classify_frame(header: fits.Header,
     Detection cascade:
       1. IMAGETYP header (Seestar provides this; DWARF does not)
       2. OBJECT header populated → LIGHT  (DWARF light frames)
-      3. OBJECT empty + RA≈0 + DEC≈0 → DARK  (DWARF dark frames)
+      3. OBJECT empty + RA≈0 + DEC≈0 → DARK  (DWARF dark frames, named raw_… / dark_…);
+         the same header with any other file name is an untargeted capture → UNKNOWN (review)
       4. Filename prefix  ← bias_/dark_/flat_/raw_/light_/unknown_/failed_/stacked-/stacked_
       5. UNKNOWN (logged to surprises.log)
 
@@ -489,6 +497,16 @@ def classify_frame(header: fits.Header,
         ra  = float(header.get('RA',  -999))
         dec = float(header.get('DEC', -999))
         if abs(ra) < 0.001 and abs(dec) < 0.001:
+            # No target and no coordinates.  DWARF darks look like this, and their file
+            # names say so (raw_…, dark_…).  A file named like a light frame
+            # (e.g. 0.0333333s130_VIS_<time>.fits, failed_…, stacked-N_…) is an
+            # UNTARGETED CAPTURE, not a calibration frame: send it to review.
+            if filename is not None:
+                by_name = classify_from_filename(filename)
+                if by_name not in ('DARK', 'BIAS', 'FLAT'):
+                    logger.debug(f"[untargeted] {filename} → UNKNOWN (no OBJECT and RA/DEC = 0, "
+                                 f"but the file name is not a calibration name)")
+                    return 'UNKNOWN', warnings
             return 'DARK', warnings
     except (ValueError, TypeError):
         pass
@@ -552,6 +570,7 @@ MIN_PLAUSIBLE_YEAR = 2015
 # Collected during a scan and reported once at the end (not one warning per file)
 _implausible_dates: list = []
 _truncated_files:   list = []
+_size_identified:   list = []     # devices identified by image size alone (stripped headers)
 
 
 def is_plausible_year(year: int) -> bool:
@@ -843,6 +862,7 @@ def scan_directory(root_path: Path, recursive: bool = True) -> list:
 
     _implausible_dates.clear()
     _truncated_files.clear()
+    _size_identified.clear()
     results = []
     for i, fits_file in enumerate(fits_files, 1):
         logger.debug(f"[{i}/{len(fits_files)}] {fits_file.name}")
@@ -854,6 +874,11 @@ def scan_directory(root_path: Path, recursive: bool = True) -> list:
             f"(e.g. '{_implausible_dates[0]}') — device clock not set? Those dates "
             f"were ignored; the year comes from the folder path and times from the "
             f"filename.")
+    if _size_identified:
+        from collections import Counter as _Counter
+        counts = ", ".join(f"{n} × {k}" for k, n in sorted(_Counter(_size_identified).items()))
+        logger.info(f"{len(_size_identified)} file(s) with stripped headers (calibration frames) "
+                    f"were identified by image size: {counts}")
     if _truncated_files:
         logger.warning(
             f"{len(_truncated_files)} truncated file(s) found "

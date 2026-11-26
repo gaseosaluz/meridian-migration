@@ -1,6 +1,6 @@
 #!/bin/sh
 # copy_verify.sh — copy a folder tree, keep the file dates, then verify the copy.
-# Companion to the fits tools 0.10.0.  Works in sh, bash and zsh (macOS and Linux).
+# Companion to the fits tools 0.13.0.  Works in sh, bash and zsh (macOS and Linux).
 #
 # Usage:
 #   ./copy_verify.sh SOURCE_FOLDER DEST_FOLDER          copy, then verify
@@ -66,7 +66,7 @@ LOG="copy_verify_$STAMP.log"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/copy_verify.XXXXXX") || die "cannot create a temporary folder"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "  copy_verify  (fits tools 0.10.0)"
+echo "  copy_verify  (fits tools 0.13.0)"
 echo "  Source      : $SRC_ABS"
 echo "  Destination : $DEST_ABS"
 

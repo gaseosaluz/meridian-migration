@@ -920,3 +920,105 @@ class TestMasterDark:
         assert meta.exposure_time == 30.0 and meta.temperature == 20.3
         assert not [r for r in caplog.records if 'Cannot classify' in r.message]
         assert meta.is_valid
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.11.0 — stripped-header calibration files identified by image size: no warning
+# ══════════════════════════════════════════════════════════════════════════════
+class TestStrippedHeaderBySize:
+    def test_empty_identity_headers_are_expected_not_a_warning(self, caplog):
+        h = make_header({'NAXIS1': 3856, 'NAXIS2': 2180})
+        with caplog.at_level(_logging.WARNING, logger='fits_extractor'):
+            device, warnings, source = detect_device(h, Path('/data/new/dark_exp_10.000000_gain_60_bin_1_33C_stack_3.fits'))
+        assert (device, warnings, source) == ('DWARF_3', [], 'dimensions')
+        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING]
+
+    def test_mini_and_s30_pro_sizes(self):
+        assert detect_device(make_header({'NAXIS1': 1920, 'NAXIS2': 1080}))[0] == 'DWARF_MINI'
+        assert detect_device(make_header({'NAXIS1': 2160, 'NAXIS2': 3840}))[0] == 'SEESTAR_S30_PRO'
+
+    def test_a_named_but_unknown_telescope_still_warns(self):
+        h = make_header({'TELESCOP': 'DWARF-III-V2', 'NAXIS1': 3856, 'NAXIS2': 2180})
+        device, warnings, source = detect_device(h)
+        assert device == 'DWARF_3' and len(warnings) == 1 and source == 'dimensions'
+
+    def test_unknown_size_with_empty_headers_is_still_unknown(self):
+        device, warnings, source = detect_device(make_header({'NAXIS1': 100, 'NAXIS2': 100}))
+        assert device == 'UNKNOWN' and warnings and source == 'unknown'
+
+    def test_scan_summarises_with_one_info_line(self, tmp_path, caplog):
+        import numpy as np
+        from fits_metadata_extractor import scan_directory
+        d = tmp_path / 'new'
+        d.mkdir()
+        for i, (w, hgt) in enumerate([(3856, 2180)] * 3 + [(1920, 1080)] * 2):
+            fits.PrimaryHDU(np.zeros((hgt, w), dtype='uint8')).writeto(d / f'dark_exp_10.000000_gain_60_bin_1_3{i}C_stack_3.fits')
+        with caplog.at_level(_logging.INFO, logger='fits_extractor'):
+            results = scan_directory(tmp_path)
+        msgs = [r for r in caplog.records if 'identified by image size' in r.message]
+        assert len(msgs) == 1 and msgs[0].levelno == _logging.INFO
+        assert '5 file(s) with stripped headers' in msgs[0].message
+        assert '3 × 3856×2180 → DWARF_3' in msgs[0].message and '2 × 1920×1080 → DWARF_MINI' in msgs[0].message
+        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert {r.device_type for r in results} == {'DWARF_3', 'DWARF_MINI'}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.13.0 — untargeted captures (no OBJECT, RA = DEC = 0) are not darks
+# ══════════════════════════════════════════════════════════════════════════════
+UNTARGETED = {'OBJECT': '        ', 'RA': 0.0, 'DEC': 0.0, 'EXPTIME': 0.03333334, 'GAIN': 130,
+              'FILTER': 'VIS', 'TELESCOP': 'DWARF 3', 'NAXIS1': 3856, 'NAXIS2': 2180}
+
+
+class TestUntargetedCaptures:
+    @pytest.mark.parametrize('name', [
+        '0.0333333s130_VIS_20261021-192115361_24C.fits',
+        'failed_0.0333333s130_VIS_20261021-192116000_24C.fits',
+        'stacked-16_0.0333333s130_VIS_20261021-192200000_24C.fits',
+        'unknown_abc.fits',
+        'something_else.fits',
+    ])
+    def test_light_style_names_go_to_unknown(self, name):
+        assert classify_frame(make_header(UNTARGETED), name)[0] == 'UNKNOWN'
+
+    @pytest.mark.parametrize('name', [
+        'raw_10s_60_0000_20260102-184951912_35C.fits',
+        'RAW_10s_60_0000_20260102-184951912_35C.fits',
+        'dark_exp_30.000000_gain_60_bin_1_34C_stack_1.fits',
+        'bias_gain_2_bin_1.fits',
+        'flat_gain_2_bin_1_ir_0.fits',
+        'MasterDark_5_30.0s_20.3C_20261116-200246.fit',
+    ])
+    def test_calibration_names_stay_calibration(self, name):
+        frame, warnings = classify_frame(make_header(UNTARGETED), name)
+        assert frame in ('DARK', 'BIAS', 'FLAT') and warnings == []
+
+    def test_header_only_call_keeps_old_behaviour(self):
+        assert classify_frame(make_header(UNTARGETED)) == ('DARK', [])
+
+    def test_a_target_always_means_light(self):
+        h = make_header({**UNTARGETED, 'OBJECT': 'M 31'})
+        assert classify_frame(h, '0.0333333s130_VIS_x.fits')[0] == 'LIGHT'
+
+    def test_nonzero_coordinates_without_object_still_use_the_file_name(self):
+        h = make_header({**UNTARGETED, 'RA': 10.7, 'DEC': 41.3})
+        assert classify_frame(h, 'raw_10s_60_0000_x.fits')[0] == 'DARK'
+        frame, warnings = classify_frame(h, 'mystery.fits')
+        assert frame == 'UNKNOWN' and warnings           # unchanged: this one warns
+
+    def test_extract_metadata_of_the_real_header_pattern(self, tmp_path, caplog):
+        import numpy as np
+        h = fits.Header()
+        for k, v in {'OBJECT': '        ', 'RA': 0.0, 'DEC': 0.0, 'EXPTIME': 0.03333334, 'GAIN': 130, 'FILTER': 'VIS',
+                     'TELESCOP': 'DWARF 3', 'INSTRUME': 'DWARF 3', 'ORIGIN': 'DWARFLAB', 'FIRMWARE': '1.5.3.9',
+                     'DATE-OBS': '2026-10-21T19:21:15.361'}.items():
+            h[k] = v
+        p = tmp_path / '0.0333333s130_VIS_20261021-192115361_24C.fits'
+        fits.PrimaryHDU(np.zeros((8, 4), dtype='uint16'), header=h).writeto(p)
+        with caplog.at_level(_logging.WARNING, logger='fits_extractor'):
+            meta = extract_metadata(p)
+        assert meta.frame_type == 'UNKNOWN' and meta.device_type == 'DWARF_3' and meta.is_valid
+        assert meta.observation_year == 2026
+        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING]

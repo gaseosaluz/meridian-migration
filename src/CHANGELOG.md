@@ -4,6 +4,42 @@ One shared version for all files (`fits_metadata_extractor.py`, `fits_migrator.p
 `session_report.py`, `copy_verify.sh`). Versions bump together; see `RELEASING.md`.
 Dates were not recorded for 0.1.0 – 0.7.0.
 
+## [0.13.0] - 2026-11-26
+### Changed
+- A frame with no target (`OBJECT` empty) and no coordinates (`RA = DEC = 0`) is only called a dark when its
+  file name is a calibration name (`raw_…`, `dark_…`, `bias_…`, `flat_…`, `MasterDark_…`). Any other name
+  (a light-style name such as `0.0333333s130_VIS_<time>.fits`, `failed_…`, `stacked-N_…`) is an untargeted
+  capture: frame type UNKNOWN, so it goes to the review folder instead of `_Calibration/Dark/`. Found when 134
+  black 1/30-second frames from a DWARF 3 session with no target set would have been filed as darks.
+  Header-only calls (no file name) keep the old behaviour.
+### Added
+- The summary has an `Unclassified` line: how many files went to review because of that, and from which
+  folders (up to five).
+
+## [0.12.0] - 2026-11-26
+### Changed
+- "Already present" no longer depends on the modification date alone. A file with the same name and
+  size as one already in the output folder but a DIFFERENT date is now compared byte for byte:
+  identical content counts as present (not copied again); different content still gets a `_2` copy.
+  Found when a fresh download of nights that were already migrated had every date shifted by exactly
+  one hour (the size matched, the dates did not), so a dry run showed "already present 0" and a real
+  run would have copied everything again. The Plan check and the final line report how many files
+  matched by content and the date offset (e.g. `-3600 s × 3512`). Files with dates within 2 s are
+  still accepted without reading them. Comparisons are done once per file pair (cached).
+- Note: version 0.11.0 (the `--default-year` and stripped-header changes) is included here.
+
+## [0.11.0] - 2026-11-26
+### Added
+- `--default-year YYYY`: the year folder for files that have no date anywhere (no header date,
+  no year in the path, no time in the file name), typically calibration frames in a new download
+  folder that has no year in its name. Without it they go to `_UnknownYear` and the summary says
+  how many, and names the option.
+### Changed
+- Calibration frames with stripped headers (empty TELESCOP / INSTRUMENT / CREATOR) that are
+  identified by image size no longer produce one "possible firmware rename" warning each. They are
+  logged at debug level plus ONE summary line (e.g. `15 file(s) with stripped headers ... 11 × 3856×2180
+  → DWARF_3`). A header that names an unknown telescope still warns.
+
 ## [0.10.0] - 2026-11-25
 ### Added
 - Seestar S30 Pro `MasterDark_<n>_<exp>s_<temp>C_<time>.fit` files (new after a firmware update)

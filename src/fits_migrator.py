@@ -6,7 +6,7 @@ Astrophotography Migration Engine
 Phase 2: Reorganize files into Meridian structure
 
 Built for Ed's Astrophotography Migration Project
-Version 0.10.0 - see CHANGELOG.md
+Version 0.13.0 - see CHANGELOG.md
 Sprint 2, Phase 2 - Rev 4: per-night sessions + safe re-runs + --target
 
 Reads metadata extracted by fits_metadata_extractor.py and reorganizes
@@ -79,7 +79,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 # Phase 1 extractor — must be in the same directory (or on PYTHONPATH)
@@ -93,7 +93,7 @@ from fits_metadata_extractor import (
 )
 
 # One shared project version (must equal the extractor's; see RELEASING.md)
-__version__ = "0.10.0"
+__version__ = "0.13.0"
 try:
     from fits_metadata_extractor import __version__ as EXTRACTOR_VERSION
 except ImportError:                                  # extractor older than 0.8.0
@@ -608,13 +608,65 @@ def _resolve_dest(source: Path, dest: Path, claimed: set, match_existing: bool =
         candidate = dest.with_name(f"{dest.stem}_{n}{dest.suffix}")
 
 
+# Pairs (source, destination) found to have IDENTICAL content but a different modification
+# date, with the offset in seconds.  Filled by _same_file, summarised in the Plan check.
+_DATE_OFFSETS: dict = {}
+_CONTENT_CACHE: dict = {}
+_content_compares: list = [0]          # how many content comparisons were done (for progress)
+
+
+def _same_content(a: Path, b: Path, chunk: int = 4 * 1024 * 1024) -> bool:
+    """Byte-for-byte comparison (stops at the first difference)."""
+    try:
+        with open(a, 'rb') as fa, open(b, 'rb') as fb:
+            while True:
+                ba, bb = fa.read(chunk), fb.read(chunk)
+                if ba != bb:
+                    return False
+                if not ba:
+                    return True
+    except OSError:
+        return False
+
+
 def _same_file(source: Path, dest: Path) -> bool:
-    """True when dest already holds a copy of source (same size, same mtime +-2 s)."""
+    """True when dest already holds a copy of source.
+
+    Same size and the same modification time (within 2 s) is enough.  The same size with a
+    DIFFERENT date is not trusted: a fresh download or a copy through a drive that keeps
+    local time (FAT / exFAT) can shift dates by whole hours.  Those pairs are compared
+    byte for byte; identical content counts as present, different content does not.
+    """
     try:
         s, d = source.stat(), dest.stat()
     except OSError:
         return False
-    return s.st_size == d.st_size and abs(s.st_mtime - d.st_mtime) <= 2
+    if s.st_size != d.st_size:
+        return False
+    offset = d.st_mtime - s.st_mtime
+    if abs(offset) <= 2:
+        return True
+    key = (str(source), str(dest), s.st_size, s.st_mtime_ns, d.st_mtime_ns)
+    if key not in _CONTENT_CACHE:
+        if _content_compares[0] == 0:
+            logger.info("Files with the same name and size but different dates found — "
+                        "comparing their contents (this can take a while on a large folder)")
+        _content_compares[0] += 1
+        if _content_compares[0] % 500 == 0:
+            logger.info(f"  … {_content_compares[0]} contents compared")
+        _CONTENT_CACHE[key] = _same_content(source, dest)
+    same = _CONTENT_CACHE[key]
+    if same:
+        _DATE_OFFSETS[(str(source), str(dest))] = int(round(offset))
+    return same
+
+
+def date_offset_summary(pairs=None) -> str:
+    """e.g. '+3600 s × 3512' for the files matched by content despite different dates."""
+    from collections import Counter as _C
+    offsets = list(_DATE_OFFSETS.values()) if pairs is None else \
+        [_DATE_OFFSETS[p] for p in pairs if p in _DATE_OFFSETS]
+    return ", ".join(f"{o:+d} s × {n}" for o, n in sorted(_C(offsets).items(), key=lambda kv: -kv[1])[:3])
 
 
 def check_free_space(plan: list, output_root: Path, margin: float = 0.02):
@@ -655,7 +707,8 @@ def plan_migration(results:     list,
                    min_session_minutes: float = DEFAULT_MIN_SESSION_MINUTES,
                    tz_name: str = DEFAULT_TZ,
                    target_filter=None,
-                   review_root: Optional[Path] = None) -> list:
+                   review_root: Optional[Path] = None,
+                   default_year: Optional[str] = None) -> list:
     """
     Build a migration plan from a list of FITSMetadata objects.
 
@@ -672,6 +725,9 @@ def plan_migration(results:     list,
                        False restores the Rev 2 merged layout.
         min_session_minutes: sessions with less total exposure go to _Review
         tz_name:       timezone used to convert Seestar UTC header times
+        default_year:  year folder for files that have no year anywhere (no header
+                       date, no year in the path, no time in the file name);
+                       they would otherwise go to _UnknownYear
         review_root:   where frames needing review go (None = <output>/.../_Review,
                        inside the tree; the CLI defaults to a folder OUTSIDE it)
         target_filter: Rev 4 — a target name or list of names (case-insensitive);
@@ -687,6 +743,8 @@ def plan_migration(results:     list,
 
     for meta in results:
         source = Path(meta.file_path)
+        if default_year and _year_folder(meta) == FOLDER_UNKNOWN_YEAR:
+            meta = replace(meta, observation_year=int(default_year))   # copy; caller's list untouched
 
         # ── Filters ───────────────────────────────────────────────────────────
         if year_filter and _year_folder(meta) != year_filter:
@@ -813,6 +871,9 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
     print(f"  Devices       : {dict(sorted(devices.items()))}")
     print(f"  Frame types   : {dict(sorted(frames.items()))}")
     print(f"  Years         : {dict(sorted(years.items()))}")
+    if FOLDER_UNKNOWN_YEAR in years:
+        print(f"  ⚠ No year     : {years[FOLDER_UNKNOWN_YEAR]} file(s) have no date anywhere and go to "
+              f"{FOLDER_UNKNOWN_YEAR}/ — add --default-year YYYY to choose their year")
     print(f"  Targets       : {len(targets)} unique")
     for t in sorted(targets):
         print(f"    • {t}")
@@ -852,6 +913,17 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
                 note = '  — consider discarding that night' if pct >= 50 else ''
                 print(f"    ⚑ {sess_dirs[(k, 'failed frame')]}  [{device}]  "
                       f"{n} failed ({pct:.0f}% of that night){note}")
+    unclassified = [a for a in plan if not a.is_skip and a.frame_type == 'UNKNOWN']
+    if unclassified:
+        by_folder: dict = {}
+        for a in unclassified:
+            by_folder[a.source.parent.name] = by_folder.get(a.source.parent.name, 0) + 1
+        print(f"  Unclassified  : {len(unclassified)} file(s) moved to _Review "
+              f"(no usable frame type, or no target and no coordinates)")
+        for folder, n in sorted(by_folder.items(), key=lambda kv: -kv[1])[:5]:
+            print(f"    ⚑ {n:5d}  {folder}")
+        if len(by_folder) > 5:
+            print(f"    … and {len(by_folder) - 5} more folder(s)")
     truncated = [a for a in plan if not a.is_skip and a.review_reason == 'truncated file']
     if truncated:
         print(f"  Truncated     : {len(truncated)} file(s) moved to _Review "
@@ -867,6 +939,19 @@ def print_summary(plan: list, dry_run: bool = True) -> None:
 # Executor
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _present(action, claimed: set, stats: dict) -> bool:
+    """Dry-run helper: is this file already in the output folder?  Updates the counters."""
+    resolved, present = _resolve_dest(action.source, action.dest, claimed,
+                                      match_existing=(action.operation == 'copy'))
+    if not present:
+        return False
+    stats['already_present'] += 1
+    if (str(action.source), str(resolved)) in _DATE_OFFSETS:
+        stats['present_by_content'] += 1
+        stats['_date_pairs'].append((str(action.source), str(resolved)))
+    return True
+
+
 def execute_plan(plan:     list,
                  dry_run:  bool = True,
                  output_root: Optional[Path] = None) -> dict:
@@ -879,7 +964,8 @@ def execute_plan(plan:     list,
     Returns a stats dict: {'copied': N, 'moved': N, 'skipped': N, 'errors': N}
     """
     stats = {'copied': 0, 'moved': 0, 'skipped': 0, 'errors': 0,
-             'already_present': 0, 'no_space': False}
+             'already_present': 0, 'present_by_content': 0, 'no_space': False,
+             '_date_pairs': []}
 
     # Create the PixInsight placeholder so users see it immediately
     if not dry_run and output_root is not None:
@@ -898,9 +984,8 @@ def execute_plan(plan:     list,
             if not action.source.exists():
                 logger.warning(f"DRY-RUN: source missing: {action.source}")
                 stats['errors'] += 1
-            elif _resolve_dest(action.source, action.dest, claimed,
-                               match_existing=(action.operation == 'copy'))[1]:
-                stats['already_present'] += 1
+            elif _present(action, claimed, stats):
+                pass
             else:
                 key = 'copied' if action.operation == 'copy' else 'moved'
                 stats[key] = stats.get(key, 0) + 1
@@ -914,6 +999,9 @@ def execute_plan(plan:     list,
                 match_existing=(action.operation == 'copy'))
             if present:
                 stats['already_present'] += 1
+                if (str(action.source), str(resolved)) in _DATE_OFFSETS:
+                    stats['present_by_content'] += 1
+                    stats['_date_pairs'].append((str(action.source), str(resolved)))
                 logger.debug(f"PRESENT {resolved}  (already copied, skipped)")
                 continue
 
@@ -1013,6 +1101,10 @@ Examples:
                         help='Where review material goes (failed / truncated frames, '
                              'aborted and Unknown sessions). Default: a folder next to '
                              'the output folder, named <output>_Review. Do not watch it in Meridian.')
+    parser.add_argument('--default-year', metavar='YYYY',
+                        help='Year for files that have no date anywhere (no header date, no year '
+                             'in the path, no time in the file name), e.g. calibration frames from '
+                             'a folder without a year. Without it they go to _UnknownYear.')
     parser.add_argument('--create-parents', action='store_true',
                         help='Allow --execute when the output folder\'s parent does not exist '
                              '(normally a sign of a mistyped path)')
@@ -1033,6 +1125,10 @@ Examples:
     parser.add_argument('--verbose',   action='store_true',
                         help='Show every individual file operation')
     args = parser.parse_args()
+
+    if args.default_year is not None:
+        if not re.fullmatch(r'\d{4}', args.default_year) or not is_plausible_year(int(args.default_year)):
+            parser.error(f"--default-year must be a plausible 4-digit year, got '{args.default_year}'")
 
     try:
         ZoneInfo(args.tz)
@@ -1084,6 +1180,7 @@ Examples:
     print(f"  Review    : {review_root if review_root else 'inside the output tree (--review-in-tree)'}")
     if args.year:   print(f"  Year      : {args.year}")
     if args.device: print(f"  Device    : {args.device}")
+    if args.default_year: print(f"  Def. year : {args.default_year}  (for files with no date anywhere)")
     if args.target: print(f"  Target(s) : {', '.join(args.target)}")
     print(f"  Nights    : {'MERGED (old layout)' if args.merge_nights else 'SPLIT per night, tz ' + args.tz}")
     if parent_problem:
@@ -1107,6 +1204,7 @@ Examples:
         tz_name=args.tz,
         target_filter=args.target,
         review_root=review_root,
+        default_year=args.default_year,
     )
 
     # ── Report ────────────────────────────────────────────────────────────────
@@ -1136,6 +1234,9 @@ Examples:
         if stats.get('already_present'):
             print("                  (files already in the output folder with the same size "
                   "and date are not copied again)")
+        if stats.get('present_by_content'):
+            print(f"  Dates differ  : {stats['present_by_content']} of those have identical content "
+                  f"but a different modification date ({date_offset_summary(stats['_date_pairs'])})")
 
     if not dry_run:
         print(f"\n  Done — copied: {stats.get('copied', 0)}, "
@@ -1143,6 +1244,9 @@ Examples:
               f"moved: {stats.get('moved', 0)}, "
               f"skipped: {stats['skipped']}, "
               f"errors: {stats['errors']}")
+        if stats.get('present_by_content'):
+            print(f"  Dates differ  : {stats['present_by_content']} already-present file(s) had a different "
+                  f"modification date but identical content ({date_offset_summary(stats['_date_pairs'])})")
         if stats.get('no_space'):
             print("  ✗  DISK FULL — run stopped. Free space and re-run the same command; "
                   "files already copied are skipped.")
